@@ -83,15 +83,17 @@ def stream_media(phone: str, index: int):
     return PlainTextResponse("No media found")
 
 def make_tts_command(request: Request, text: str, min_dig: int, max_dig: int, sec: int, type_mode: str) -> str:
-    """מייצר פקודת קריאה תואמת לימות המשיח עם תחילית f- וסיומת mp3 קבועה"""
+    """מייצר פקודת קריאה תואמת לימות המשיח עם פסיקים כמפרידים ואות תחילית גדולה"""
     base_url = str(request.base_url).rstrip('/')
-    # תיקון פרוטוקול ל-https בשרתי Render
     if "onrender.com" in base_url and base_url.startswith("http://"):
         base_url = base_url.replace("http://", "https://")
         
     hex_text = text.encode('utf-8').hex()
     audio_url = f"{base_url}/tts/{hex_text}.mp3"
-    return f"read=f-{audio_url}=ValName={min_dig}={max_dig}={sec}={type_mode.lower()}"
+    
+    # ימות המשיח מעדיפים אות גדולה בסוג הקלט (Digits / Voice)
+    mode = type_mode.capitalize()
+    return f"read=f-{audio_url}=ValName,{min_dig},{max_dig},{sec},{mode},yes,no"
 
 @app.get("/youtube", response_class=PlainTextResponse)
 def handle_ivr(
@@ -148,7 +150,7 @@ def handle_ivr(
                 return make_tts_command(request, "שגיאה בטעינת השירים. חוזר לתפריט הראשי", 0, 0, 3, "digits")
             
             clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
-            return f"read=f-{clean_media_url}=ValName=1=1=3=digits"
+            return f"read=f-{clean_media_url}=ValName,1,1,3,Digits,yes,no"
 
         else:
             return make_tts_command(request, "לתפריט חיפוש קולי הקש 1. לשירים חדשים ועדכניים הקש 2.", 1, 1, 10, "digits")
@@ -165,7 +167,7 @@ def handle_ivr(
             session["playlist"] = urls
             session["index"] = 0
             clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
-            return f"read=f-{clean_media_url}=ValName=1=1=3=digits"
+            return f"read=f-{clean_media_url}=ValName,1,1,3,Digits,yes,no"
         else:
             session["state"] = "MAIN_MENU"
             return make_tts_command(request, "לא נמצאו תוצאות. חוזר לתפריט הראשי", 0, 0, 3, "digits")
@@ -196,6 +198,6 @@ def handle_ivr(
 
         session["index"] = idx
         clean_media_url = f"{base_url}/stream_media/{ApiPhone}/{idx}.mp3"
-        return f"read=f-{clean_media_url}=ValName=1=1=3=digits"
+        return f"read=f-{clean_media_url}=ValName,1,1,3,Digits,yes,no"
 
     return "hangup"
