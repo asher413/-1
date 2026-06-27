@@ -57,9 +57,11 @@ def stream_media(phone: str, index: int):
     return PlainTextResponse("No media found")
 
 def make_native_tts_command(text: str, min_dig: int, max_dig: int, sec: int, type_mode: str) -> str:
-    """מייצר פקודת הקראה מובנית (TTS) של ימות המשיח - יציב ב-100% ללא קבצים חיצוניים ואותיות קטנות בלבד"""
+    """מייצר פקודת הקראה מובנית (TTS) של ימות המשיח עם סדר פרמטרים תקין ומדויק"""
     clean_text = text.replace("=", "").replace(",", "").replace("-", "")
-    return f"read=t-{clean_text}=ValName,{min_dig},{max_dig},{sec},{type_mode.lower()},yes,no"
+    confirm_hash = "yes" if max_dig > 1 else "no"
+    # סדר הפרמטרים הנכון בימות המשיח: שם_הפרמטר, השמעת הקשות(no), מקסימום, מינימום, שניות המתנה, סוג הקלט, אישור בסולמית
+    return f"read=t-{clean_text}=ValName,no,{max_dig},{min_dig},{sec},{type_mode.lower()},{confirm_hash}"
 
 @app.get("/youtube", response_class=PlainTextResponse)
 def handle_ivr(
@@ -87,15 +89,15 @@ def handle_ivr(
 
     session = db_sessions[ApiPhone]
 
-    # 2. שלב אימות קוד גישה
+    # 2. שלב אימות קוד גישה (למי שלא ברשימת הלבנה)
     if not session["auth"]:
         if session["state"] == "CHECK_AUTH":
             if ValName == ACCESS_CODE:
                 session["auth"] = True
                 session["state"] = "MAIN_MENU"
-                ValName = None
+                ValName = None  # מאפשר כניסה ישירה לתפריט הראשי באותה קריאה
             else:
-                if ValName is not None: 
+                if ValName is not None and ValName != "": 
                     return make_native_tts_command("קוד שגוי אנא נסה שנית", 4, 4, 10, "digits")
                 return make_native_tts_command("אנא הקש את קוד הגישה בן ארבע הספרות", 4, 4, 10, "digits")
 
@@ -113,10 +115,10 @@ def handle_ivr(
             session["index"] = 0
             if not session["playlist"]:
                 session["state"] = "MAIN_MENU"
-                return make_native_tts_command("שגיאה בטעינת השירים חוזר לתפריט הראשי", 0, 0, 3, "digits")
+                return make_native_tts_command("שגיאה בטעינת השירים חוזר לתפריט הראשי", 1, 1, 3, "digits")
             
             clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
-            return f"read=f-{clean_media_url}=ValName,1,1,3,digits,yes,no"
+            return f"read=f-{clean_media_url}=ValName,no,1,1,3,digits,no"
 
         else:
             return make_native_tts_command("לתפריט חיפוש קולי הקש 1 לשירים חדשים ועדכניים הקש 2", 1, 1, 10, "digits")
@@ -125,7 +127,7 @@ def handle_ivr(
     elif state == "WAITING_FOR_SEARCH":
         if not ValName:
             session["state"] = "MAIN_MENU"
-            return make_native_tts_command("לא התקבל קלט חוזר לתפריט הראשי", 0, 0, 3, "digits")
+            return make_native_tts_command("לא התקבל קלט חוזר לתפריט הראשי", 1, 1, 3, "digits")
         
         urls = fetch_youtube_urls(ValName, max_results=1)
         if urls:
@@ -133,15 +135,15 @@ def handle_ivr(
             session["playlist"] = urls
             session["index"] = 0
             clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
-            return f"read=f-{clean_media_url}=ValName,1,1,3,digits,yes,no"
+            return f"read=f-{clean_media_url}=ValName,no,1,1,3,digits,no"
         else:
             session["state"] = "MAIN_MENU"
-            return make_native_tts_command("לא נמצאו תוצאות חוזר לתפריט הראשי", 0, 0, 3, "digits")
+            return make_native_tts_command("לא נמצאו תוצאות חוזר לתפריט הראשי", 1, 1, 3, "digits")
 
     # --- שליטה בזמן השמעת חיפוש ---
     elif state == "PLAYING_SEARCH":
         session["state"] = "MAIN_MENU"
-        return make_native_tts_command("ההשמעה הסתיימה חוזר לתפריט הראשי", 0, 0, 3, "digits")
+        return make_native_tts_command("ההשמעה הסתיימה חוזר לתפריט הראשי", 1, 1, 3, "digits")
 
     # --- שליטה בנגן פלייליסט ---
     elif state == "PLAYING_LATEST":
@@ -154,16 +156,18 @@ def handle_ivr(
             idx -= 1
         elif ValName == "0":  # חזרה לתפריט
             session["state"] = "MAIN_MENU"
-            return make_native_tts_command("חוזר לתפריט הראשי", 0, 0, 3, "digits")
+            return make_native_tts_command("חוזר לתפריט הראשי", 1, 1, 3, "digits")
+        elif not ValName:  # אם לא הוקש כלום והשיר הסתיים לבד - נעבור אוטומטית לשיר הבא!
+            idx += 1
 
         if idx >= len(playlist):
             session["state"] = "MAIN_MENU"
-            return make_native_tts_command("הגעת לסוף הפלייליסט חוזר לתפריט הראשי", 0, 0, 3, "digits")
+            return make_native_tts_command("הגעת לסוף הפלייליסט חוזר לתפריט הראשי", 1, 1, 3, "digits")
         elif idx < 0:
             idx = 0 
 
         session["index"] = idx
         clean_media_url = f"{base_url}/stream_media/{ApiPhone}/{idx}.mp3"
-        return f"read=f-{clean_media_url}=ValName,1,1,3,digits,yes,no"
+        return f"read=f-{clean_media_url}=ValName,no,1,1,3,digits,no"
 
     return "hangup"
