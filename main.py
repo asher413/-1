@@ -1,10 +1,8 @@
 import io
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-import requests
 import yt_dlp
-from gtts import gTTS
 
 app = FastAPI()
 
@@ -44,56 +42,24 @@ def fetch_youtube_urls(query: str, max_results=5):
             print(f"Error fetching YouTube: {e}")
             return []
 
-@app.get("/tts/{hex_text}.mp3")
-def text_to_speech(hex_text: str):
-    """מייצר קובץ אודיו מהטקסט ומחזיר אותו עם סיומת mp3 מדומה שהמערכת אוהבת"""
-    try:
-        text = bytes.fromhex(hex_text).decode('utf-8')
-    except Exception:
-        text = "שגיאה"
-    
-    tts = gTTS(text=text, lang='he')
-    fp = io.BytesIO()
-    tts.write_to_fp(fp)
-    fp.seek(0)
-    return StreamingResponse(fp, media_type="audio/mpeg")
-
 @app.get("/stream_media/{phone}/{index}.mp3")
 def stream_media(phone: str, index: int):
-    """מזרים את האודיו של יוטיוב ישירות לימות המשיח כקובץ mp3 נקי ללא הפניות"""
+    """מפנה את ימות המשיח ישירות לשרתי גוגל/יוטיוב בצורה אופטימלית ויציבה"""
     try:
         if phone in db_sessions and db_sessions[phone]["playlist"]:
             playlist = db_sessions[phone]["playlist"]
             idx = int(index)
             if 0 <= idx < len(playlist):
-                video_url = playlist[idx]
-                
-                # פונקציה פנימית שמזרימה את השיר בחלקים קטנים כדי לא להעמיס על זיכרון השרת
-                def generate_chunks():
-                    with requests.get(video_url, stream=True) as r:
-                        r.raise_for_status()
-                        for chunk in r.iter_content(chunk_size=65536):
-                            if chunk:
-                                yield chunk
-                                
-                return StreamingResponse(generate_chunks(), media_type="audio/mpeg")
+                return RedirectResponse(url=playlist[idx])
     except Exception as e:
-        print(f"Error streaming media: {e}")
+        print(f"Error redirecting stream: {e}")
     
     return PlainTextResponse("No media found")
 
-def make_tts_command(request: Request, text: str, min_dig: int, max_dig: int, sec: int, type_mode: str) -> str:
-    """מייצר פקודת קריאה תואמת לימות המשיח עם פסיקים כמפרידים ואות תחילית גדולה"""
-    base_url = str(request.base_url).rstrip('/')
-    if "onrender.com" in base_url and base_url.startswith("http://"):
-        base_url = base_url.replace("http://", "https://")
-        
-    hex_text = text.encode('utf-8').hex()
-    audio_url = f"{base_url}/tts/{hex_text}.mp3"
-    
-    # ימות המשיח מעדיפים אות גדולה בסוג הקלט (Digits / Voice)
-    mode = type_mode.capitalize()
-    return f"read=f-{audio_url}=ValName,{min_dig},{max_dig},{sec},{mode},yes,no"
+def make_native_tts_command(text: str, min_dig: int, max_dig: int, sec: int, type_mode: str) -> str:
+    """מייצר פקודת הקראה מובנית (TTS) של ימות המשיח - יציב ב-100% ללא קבצים חיצוניים ואותיות קטנות בלבד"""
+    clean_text = text.replace("=", "").replace(",", "").replace("-", "")
+    return f"read=t-{clean_text}=ValName,{min_dig},{max_dig},{sec},{type_mode.lower()},yes,no"
 
 @app.get("/youtube", response_class=PlainTextResponse)
 def handle_ivr(
@@ -130,8 +96,8 @@ def handle_ivr(
                 ValName = None
             else:
                 if ValName is not None: 
-                    return make_tts_command(request, "קוד שגוי. אנא נסה שנית", 4, 4, 10, "digits")
-                return make_tts_command(request, "אנא הקש את קוד הגישה בן ארבע הספרות", 4, 4, 10, "digits")
+                    return make_native_tts_command("קוד שגוי אנא נסה שנית", 4, 4, 10, "digits")
+                return make_native_tts_command("אנא הקש את קוד הגישה בן ארבע הספרות", 4, 4, 10, "digits")
 
     state = session["state"]
 
@@ -139,7 +105,7 @@ def handle_ivr(
     if state == "MAIN_MENU":
         if ValName == "1":
             session["state"] = "WAITING_FOR_SEARCH"
-            return make_tts_command(request, "אנא אמרו את שם השיר או השיעור המבוקש ונחפש אותו ביוטיוב", 1, 1, 10, "voice")
+            return make_native_tts_command("אנא אמרו את שם השיר או השיעור המבוקש", 1, 1, 10, "voice")
         
         elif ValName == "2":
             session["state"] = "PLAYING_LATEST"
@@ -147,19 +113,19 @@ def handle_ivr(
             session["index"] = 0
             if not session["playlist"]:
                 session["state"] = "MAIN_MENU"
-                return make_tts_command(request, "שגיאה בטעינת השירים. חוזר לתפריט הראשי", 0, 0, 3, "digits")
+                return make_native_tts_command("שגיאה בטעינת השירים חוזר לתפריט הראשי", 0, 0, 3, "digits")
             
             clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
-            return f"read=f-{clean_media_url}=ValName,1,1,3,Digits,yes,no"
+            return f"read=f-{clean_media_url}=ValName,1,1,3,digits,yes,no"
 
         else:
-            return make_tts_command(request, "לתפריט חיפוש קולי הקש 1. לשירים חדשים ועדכניים הקש 2.", 1, 1, 10, "digits")
+            return make_native_tts_command("לתפריט חיפוש קולי הקש 1 לשירים חדשים ועדכניים הקש 2", 1, 1, 10, "digits")
 
     # --- עיבוד תוצאת חיפוש קולי ---
     elif state == "WAITING_FOR_SEARCH":
         if not ValName:
             session["state"] = "MAIN_MENU"
-            return make_tts_command(request, "לא התקבל קלט. חוזר לתפריט הראשי", 0, 0, 3, "digits")
+            return make_native_tts_command("לא התקבל קלט חוזר לתפריט הראשי", 0, 0, 3, "digits")
         
         urls = fetch_youtube_urls(ValName, max_results=1)
         if urls:
@@ -167,15 +133,15 @@ def handle_ivr(
             session["playlist"] = urls
             session["index"] = 0
             clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
-            return f"read=f-{clean_media_url}=ValName,1,1,3,Digits,yes,no"
+            return f"read=f-{clean_media_url}=ValName,1,1,3,digits,yes,no"
         else:
             session["state"] = "MAIN_MENU"
-            return make_tts_command(request, "לא נמצאו תוצאות. חוזר לתפריט הראשי", 0, 0, 3, "digits")
+            return make_native_tts_command("לא נמצאו תוצאות חוזר לתפריט הראשי", 0, 0, 3, "digits")
 
     # --- שליטה בזמן השמעת חיפוש ---
     elif state == "PLAYING_SEARCH":
         session["state"] = "MAIN_MENU"
-        return make_tts_command(request, "ההשמעה הסתיימה. חוזר לתפריט הראשי", 0, 0, 3, "digits")
+        return make_native_tts_command("ההשמעה הסתיימה חוזר לתפריט הראשי", 0, 0, 3, "digits")
 
     # --- שליטה בנגן פלייליסט ---
     elif state == "PLAYING_LATEST":
@@ -188,16 +154,16 @@ def handle_ivr(
             idx -= 1
         elif ValName == "0":  # חזרה לתפריט
             session["state"] = "MAIN_MENU"
-            return make_tts_command(request, "חוזר לתפריט הראשי", 0, 0, 3, "digits")
+            return make_native_tts_command("חוזר לתפריט הראשי", 0, 0, 3, "digits")
 
         if idx >= len(playlist):
             session["state"] = "MAIN_MENU"
-            return make_tts_command(request, "הגעת לסוף הפלייליסט. חוזר לתפריט הראשי", 0, 0, 3, "digits")
+            return make_native_tts_command("הגעת לסוף הפלייליסט חוזר לתפריט הראשי", 0, 0, 3, "digits")
         elif idx < 0:
             idx = 0 
 
         session["index"] = idx
         clean_media_url = f"{base_url}/stream_media/{ApiPhone}/{idx}.mp3"
-        return f"read=f-{clean_media_url}=ValName,1,1,3,Digits,yes,no"
+        return f"read=f-{clean_media_url}=ValName,1,1,3,digits,yes,no"
 
     return "hangup"
