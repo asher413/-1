@@ -20,24 +20,27 @@ app.add_middleware(
 # ====================================================================
 # 🔑 הדבק כאן את מפתח ה-API שקיבלת מ-RapidAPI בין הגרשיים:
 # ====================================================================
-RAPIDAPI_KEY = "b356e0c424msh95c209990ea7472p1fe240jsn2a029b5480bf"
+RAPIDAPI_KEY = "הדבק_כאן_את_המפתח_הארוך_שלך"
 # ====================================================================
 
 db_sessions = {}
 WHITELIST = ["0534133753", "0534133754"]  
 ACCESS_CODE = "1234"                       
 
-def fetch_youtube_ids(query: str, max_results=6):
-    """מחפש ביוטיוב דרך DuckDuckGo HTML - ללא חסימות ועובד תמיד"""
+def fetch_youtube_ids(query: str, max_results=30, filter_newest=False):
+    """מחפש ביוטיוב דרך DuckDuckGo HTML עם תמיכה בסינון לפי התאריך הכי עדכני"""
     encoded_query = urllib.parse.quote(query)
-    url = f"https://html.duckduckgo.com/html/?q={encoded_query}+site:youtube.com"
+    
+    # אם נדרש סינון שירים חדשים, נפעיל פילטר של החודש האחרון בלבד (df=m)
+    date_filter = "&df=m" if filter_newest else ""
+    url = f"https://html.duckduckgo.com/html/?q={encoded_query}+site:youtube.com{date_filter}"
     
     try:
         req = urllib.request.Request(
             url, 
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
         )
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, timeout=6) as response:
             html = response.read().decode('utf-8', errors='ignore')
             
             raw_matches = re.findall(r'watch\?v=([a-zA-Z0-9_-]{11})', html)
@@ -51,15 +54,16 @@ def fetch_youtube_ids(query: str, max_results=6):
                     break
                     
             if video_ids:
+                print(f"Found {len(video_ids)} fresh videos.")
                 return video_ids
     except Exception as e:
-        print(f"DuckDuckGo search failed: {e}")
+        print(f"DuckDuckGo extraction failed: {e}")
             
     return ["YmK2mZf_uRE", "7un666Y6N_Q", "H762G1UoP2k", "4X7bLks7Oxc"][:max_results]
 
 @app.get("/stream_media/{phone}/{index}.mp3")
 def stream_media(phone: str, index: int):
-    """פונה ל-RapidAPI המקצועי, עוקף חסימות ומפנה את ימות המשיח לקישור MP3 ישיר וחסין"""
+    """פונה ל-RapidAPI ומחזיר קישור הזרמה ישיר וחסין למוזיקה"""
     try:
         if phone in db_sessions and db_sessions[phone]["playlist"]:
             playlist = db_sessions[phone]["playlist"]
@@ -67,7 +71,6 @@ def stream_media(phone: str, index: int):
             if 0 <= idx < len(playlist):
                 video_id = playlist[idx]
                 
-                # פנייה מאובטחת לשרת הפרוקסי של RapidAPI
                 api_url = f"https://youtube-mp36.p.rapidapi.com/dl?id={video_id}"
                 req = urllib.request.Request(api_url)
                 req.add_header("x-rapidapi-key", RAPIDAPI_KEY)
@@ -75,18 +78,12 @@ def stream_media(phone: str, index: int):
                 
                 with urllib.request.urlopen(req, timeout=8) as response:
                     res_data = json.loads(response.read().decode('utf-8'))
-                    
-                    # ה-API מחזיר סטטוס 'ok' וקישור ישיר בתוך שדה 'link'
                     if res_data.get("status") == "ok" and "link" in res_data:
                         mp3_link = res_data["link"]
-                        print(f"Successfully generated secure MP3 link via RapidAPI for video {video_id}")
                         return RedirectResponse(url=mp3_link)
-                    else:
-                        print(f"RapidAPI error or structure mismatch: {res_data}")
     except Exception as e:
-        print(f"Error calling RapidAPI backend: {e}")
+        print(f"RapidAPI streaming link error: {e}")
     
-    # גיבוי חירום למקרה שהמפתח לא הוכנס נכון או השרת נפל זמנית (משמיע צליל תקין כדי שהשיחה לא תתנתק)
     return RedirectResponse(url="https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3")
 
 def make_native_tts_command(text: str, min_dig: str, max_dig: str, sec: int, type_mode: str) -> str:
@@ -113,9 +110,11 @@ def handle_ivr(
 
     song_ended = request.query_params.get("play_url_end") == "yes"
 
-    base_url = str(request.base_url).rstrip('/')
-    if "onrender.com" in base_url and base_url.startswith("http://"):
-        base_url = base_url.replace("http://", "https://")
+    # 🔥 תיקון ה-Base URL הקריטי עבור Render פרוקסי!
+    # שולף את הכתובת הציבורית האמיתית החיצונית (https://your-app.onrender.com)
+    host = request.headers.get("x-forwarded-host", request.url.netloc)
+    proto = request.headers.get("x-forwarded-proto", "https")
+    base_url = f"{proto}://{host}"
 
     if ApiPhone not in db_sessions:
         is_whitelisted = ApiPhone in WHITELIST
@@ -141,6 +140,7 @@ def handle_ivr(
 
     state = session["state"]
 
+    # --- תפריט ראשי ---
     if state == "MAIN_MENU":
         if ValName == "1":
             session["state"] = "WAITING_FOR_SEARCH"
@@ -148,13 +148,15 @@ def handle_ivr(
         
         elif ValName == "2":
             session["state"] = "PLAYING_LATEST"
-            session["playlist"] = fetch_youtube_ids("שירים חדשים מיוזיק", max_results=6)
+            # מחפש מוזיקה חדשה משנת 2026 ומפעיל סינון חודש אחרון קשוח (filter_newest=True)
+            session["playlist"] = fetch_youtube_ids("שירים חדשים 2026 מוזיקה חסידית", max_results=30, filter_newest=True)
             session["index"] = 0
             clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
             return f"play_url={clean_media_url}"
         else:
             return make_native_tts_command("לתפריט חיפוש קולי הקש 1 לשירים חדשים ועדכניים הקש 2", "1", "1", 10, "digits")
 
+    # --- חיפוש קולי ---
     elif state == "WAITING_FOR_SEARCH":
         if ValName == "0":
             session["state"] = "MAIN_MENU"
@@ -163,7 +165,7 @@ def handle_ivr(
             return make_native_tts_command("לא קלטתי את הדיבור שלכם אנא אמרו את שם השיר בבירור לאחר הצליל", "1", "50", 10, "voice")
         
         session["state"] = "PLAYING_SEARCH"
-        session["playlist"] = fetch_youtube_ids(ValName, max_results=1)
+        session["playlist"] = fetch_youtube_ids(ValName, max_results=1, filter_newest=False)
         session["index"] = 0
         clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
         return f"play_url={clean_media_url}"
@@ -172,6 +174,7 @@ def handle_ivr(
         session["state"] = "MAIN_MENU"
         return make_native_tts_command("ההשמעה הסתיימה חוזר לתפריט הראשי", "1", "1", 3, "digits")
 
+    # --- נגן פלייליסט שירים חדשים ---
     elif state == "PLAYING_LATEST":
         playlist = session["playlist"]
         idx = session["index"]
@@ -184,11 +187,11 @@ def handle_ivr(
             session["state"] = "MAIN_MENU"
             return make_native_tts_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
 
+        # 🔥 פתרון הגעה לסוף הפלייליסט: במקום לחזור לתפריט, חוזרים לשיר הראשון בלולאה רציפה!
         if idx >= len(playlist):
-            session["state"] = "MAIN_MENU"
-            return make_native_tts_command("הגעת לסוף הפלייליסט חוזר לתפריט הראשי", "1", "1", 3, "digits")
-        elif idx < 0:
             idx = 0 
+        elif idx < 0:
+            idx = len(playlist) - 1 
 
         session["index"] = idx
         clean_media_url = f"{base_url}/stream_media/{ApiPhone}/{idx}.mp3"
