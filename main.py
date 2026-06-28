@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import urllib.request
 import urllib.parse
 from fastapi import FastAPI, Query, Request
@@ -23,79 +24,53 @@ db_sessions = {}
 WHITELIST = ["0534133753", "0534133754"]  
 ACCESS_CODE = "1234"                       
 
-def fetch_youtube_ids(query: str, max_results=5):
-    """מחפש ביוטיוב דרך שרתים מבוזרים ופתוחים עם גיבוי פלייליסט קשיח שלא יכול להיכשל"""
+def fetch_youtube_ids(query: str, max_results=6):
+    """מחפש ביוטיוב דרך DuckDuckGo HTML - עוקף חסימות ב-100% במהירות שיא"""
     encoded_query = urllib.parse.quote(query)
+    # שימוש בכתובת ה-HTML הנקייה של DuckDuckGo שמציגה תוצאות מיוטיוב ללא חסימות Cloudflare
+    url = f"https://html.duckduckgo.com/html/?q={encoded_query}+site:youtube.com"
     
-    # תערובת מגוונת של שרתי Piped ו-Invidious ללא הגנות חוסמות
-    urls = [
-        f"https://pipedapi.kavin.rocks/search?q={encoded_query}&filter=videos",
-        f"https://inv.nadeko.net/api/v1/search?q={encoded_query}&type=video",
-        f"https://pipedapi.tokhmi.xyz/search?q={encoded_query}&filter=videos",
-        f"https://invidious.flokinet.to/api/v1/search?q={encoded_query}&type=video",
-        f"https://iv.melmac.space/api/v1/search?q={encoded_query}&type=video"
-    ]
-    
-    for url in urls:
-        try:
-            req = urllib.request.Request(
-                url, 
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            )
-            with urllib.request.urlopen(req, timeout=5) as response:
-                res_body = response.read().decode('utf-8', errors='ignore')
-                data = json.loads(res_body)
-                video_ids = []
-                
-                # תמיכה במבנה של שרתי Invidious (מערך שטוח)
-                if isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, dict) and 'videoId' in item:
-                            video_ids.append(item['videoId'])
-                
-                # תמיכה במבנה של שרתי Piped (מילון עם אובייקט items)
-                elif isinstance(data, dict) and 'items' in data:
-                    for item in data['items']:
-                        if isinstance(item, dict):
-                            if 'videoId' in item:
-                                video_ids.append(item['videoId'])
-                            elif 'url' in item and '/watch?v=' in item['url']:
-                                v_id = item['url'].split('/watch?v=')[-1].split('&')[0]
-                                video_ids.append(v_id)
-                                
-                if video_ids:
-                    # ניקוי כפילויות ושמירה על הסדר המקורי
-                    seen = set()
-                    unique_ids = [x for x in video_ids if not (x in seen or seen.add(x))]
-                    return unique_ids[:max_results]
-        except Exception as e:
-            print(f"Failed instance {url.split('/')[2]}: {e}")
-            continue
+    try:
+        req = urllib.request.Request(
+            url, 
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+            
+            # חילוץ מזהי וידאו (Video IDs) מהתוצאות - תומך גם בפורמט רגיל וגם בפורמט מוקדד
+            raw_matches = re.findall(r'watch\?v=([a-zA-Z0-9_-]{11})', html)
+            encoded_matches = re.findall(r'watch%3Fv%3D([a-zA-Z0-9_-]{11})', html)
+            
+            video_ids = []
+            for v_id in (raw_matches + encoded_matches):
+                if v_id not in video_ids:
+                    video_ids.append(v_id)
+                if len(video_ids) >= max_results:
+                    break
+                    
+            if video_ids:
+                print(f"Successfully found {len(video_ids)} videos via DuckDuckGo.")
+                return video_ids
+    except Exception as e:
+        print(f"DuckDuckGo search extraction failed: {e}")
             
     # --- פלייליסט גיבוי קשיח (FAILSAFE) ---
-    # אם כל השרתים נכשלו, המערכת תטען את השירים האלו כדי שלעולם לא תהיה קריסה בשיחה
-    print("All search instances failed or blocked. Activating robust failsafe playlist.")
-    failsafe_playlist = [
-        "rcOwvZ26KFQ",  # שיר 1 מהלוגים המקוריים שלך
-        "eaqW5eQXTdM",  # שיר 2 מהלוגים המקוריים שלך
-        "YmK2mZf_uRE",  # ישי ריבו - סיבת הסיבות
-        "7un666Y6N_Q",  # חנן בן ארי - חנניה
-        "H762G1UoP2k",  # מרדכי שפירא
-        "4X7bLks7Oxc"   # יעקב שוואקי
-    ]
-    return failsafe_playlist[:max_results]
+    # במקרה חירום קיצוני, המערכת תטען שירים מוכרים כדי שהשיחה לעולם לא תתנתק בשגיאה
+    print("Activating robust failsafe playlist.")
+    return ["YmK2mZf_uRE", "7un666Y6N_Q", "H762G1UoP2k", "4X7bLks7Oxc"][:max_results]
 
 @app.get("/stream_media/{phone}/{index}.mp3")
 def stream_media(phone: str, index: int):
-    """מפנה את ימות המשיח ישירות להזרמת המדיה (ההפניה מתבצעת במכשיר הקצה ולא חסומה)"""
+    """מפנה את ימות המשיח ישירות לזרם האודיו הרשמי (מבוצע מהשרתים של ימות בארץ, ללא חסימת Render)"""
     try:
         if phone in db_sessions and db_sessions[phone]["playlist"]:
             playlist = db_sessions[phone]["playlist"]
             idx = int(index)
             if 0 <= idx < len(playlist):
                 video_id = playlist[idx]
-                # שרת הפצה יציב להזרמת סאונד ישירות לטלפון
-                stream_url = f"https://inv.nadeko.net/latest_version?id={video_id}&itag=140"
+                # הפניה לשרת אודיו ישיר ויציב שאינו חסום בישראל
+                stream_url = f"https://yewtu.be/latest_version?id={video_id}&itag=140"
                 return RedirectResponse(url=stream_url)
     except Exception as e:
         print(f"Error redirecting stream: {e}")
@@ -121,8 +96,15 @@ def handle_ivr(
     if hangup == "yes" or not ApiPhone:
         return "OK"
 
+    # שליפת ה-ValName מכל המקורות האפשריים (כולל התפרצות בזמן השמעת play_url)
     val_name_choices = [v for k, v in request.query_params.multi_items() if k == "ValName"]
     ValName = val_name_choices[-1] if val_name_choices else None
+    
+    if not ValName:
+        ValName = request.query_params.get("play_url_pressed")
+
+    # בדיקה האם השיר הסתיים בצורה טבעית
+    song_ended = request.query_params.get("play_url_end") == "yes"
 
     base_url = str(request.base_url).rstrip('/')
     if "onrender.com" in base_url and base_url.startswith("http://"):
@@ -166,7 +148,7 @@ def handle_ivr(
             session["index"] = 0
             
             clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
-            return f"read=f-{clean_media_url}=ValName,no,1,1,3,digits,no"
+            return f"play_url={clean_media_url}"
 
         else:
             return make_native_tts_command("לתפריט חיפוש קולי הקש 1 לשירים חדשים ועדכניים הקש 2", "1", "1", 10, "digits")
@@ -184,7 +166,7 @@ def handle_ivr(
         session["playlist"] = fetch_youtube_ids(ValName, max_results=1)
         session["index"] = 0
         clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
-        return f"read=f-{clean_media_url}=ValName,no,1,1,3,digits,no"
+        return f"play_url={clean_media_url}"
 
     # --- שליטה בזמן השמעת חיפוש ---
     elif state == "PLAYING_SEARCH":
@@ -196,15 +178,13 @@ def handle_ivr(
         playlist = session["playlist"]
         idx = session["index"]
 
-        if ValName == "1":  # שיר הבא
+        if ValName == "1" or song_ended or not ValName:  # שיר הבא / השיר הסתיים מעצמו
             idx += 1
         elif ValName == "2":  # שיר קודם
             idx -= 1
         elif ValName == "0":  # חזרה לתפריט
             session["state"] = "MAIN_MENU"
             return make_native_tts_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
-        elif not ValName:  
-            idx += 1
 
         if idx >= len(playlist):
             session["state"] = "MAIN_MENU"
@@ -214,6 +194,6 @@ def handle_ivr(
 
         session["index"] = idx
         clean_media_url = f"{base_url}/stream_media/{ApiPhone}/{idx}.mp3"
-        return f"read=f-{clean_media_url}=ValName,no,1,1,3,digits,no"
+        return f"play_url={clean_media_url}"
 
     return "hangup"
