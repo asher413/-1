@@ -22,16 +22,17 @@ WHITELIST = ["0534133753", "0534133754"]
 ACCESS_CODE = "1234"                       
 
 def fetch_youtube_urls(query: str, max_results=5):
-    """מחפש ביוטיוב תוך התחזות למכשיר אנדרואיד כדי לעקוף חסימות בוטים של חוות שרתים"""
+    """מחפש ביוטיוב תוך התחזות למכשיר TV כדי לעקוף לחלוטין חסימות בוטים בשרתים"""
     ydl_opts = {
         'format': 'bestaudio/best',
         'default_search': f'ytsearch{max_results}',
         'quiet': True,
         'no_warnings': True,
-        # מעקף חסימת בוטים - התחזות ללקוח אנדרואיד
+        'nocheckcertificate': True,
+        # מעקף חסימה קריטי - שימוש בלקוח TV שאינו דורש אימות בוטים
         'extractor_args': {
             'youtube': {
-                'player_client': ['android']
+                'player_client': ['tv', 'ios']
             }
         }
     }
@@ -63,12 +64,12 @@ def stream_media(phone: str, index: int):
     return PlainTextResponse("No media found")
 
 def make_native_tts_command(text: str, min_dig: str, max_dig: str, sec: int, type_mode: str) -> str:
-    """מייצר פקודת הקראה מובנית (TTS) ומטפל בצורה נכונה במצב קולי ללא הגבלת ספרות"""
+    """מייצר פקודת הקראה מובנית (TTS) ומטפל בצורה מדויקת בפרמטרים של ימות המשיח"""
     clean_text = text.replace("=", "").replace(",", "").replace("-", "")
     
-    # חוק ברזל בימות המשיח: במצב קולי (voice) אסור לשלוח מינימום ומקסימום ספרות!
+    # חוק ברזל: כדי למנוע קריסה לדיפולט של הקלדה, חובה לשלוח ערכים מספריים גם במצב קולי!
     if type_mode.lower() == "voice":
-        return f"read=t-{clean_text}=ValName,no,,,{sec},voice,no"
+        return f"read=t-{clean_text}=ValName,no,50,1,{sec},voice,no"
     
     confirm_hash = "yes" if (max_dig and int(max_dig) > 1) else "no"
     return f"read=t-{clean_text}=ValName,no,{max_dig},{min_dig},{sec},{type_mode.lower()},{confirm_hash}"
@@ -82,7 +83,7 @@ def handle_ivr(
     if hangup == "yes" or not ApiPhone:
         return "OK"
 
-    # פתרון גאוני לבאג השרשור של ימות המשיח: שליפת ה-ValName האחרון בלבד מתוך ה-URL
+    # שליפת ה-ValName האחרון בלבד מתוך ה-URL כדי למנוע את באג שרשור המקשים של ימות המשיח
     val_name_choices = [v for k, v in request.query_params.multi_items() if k == "ValName"]
     ValName = val_name_choices[-1] if val_name_choices else None
 
@@ -120,7 +121,7 @@ def handle_ivr(
     if state == "MAIN_MENU":
         if ValName == "1":
             session["state"] = "WAITING_FOR_SEARCH"
-            return make_native_tts_command("אנא אמרו בצורה ברורה את שם השיר או השיעור המבוקש", "", "", 10, "voice")
+            return make_native_tts_command("אנא אמרו את שם השיר או השיעור המבוקש בשלוש שניות הקרובות", "1", "50", 10, "voice")
         
         elif ValName == "2":
             session["state"] = "PLAYING_LATEST"
@@ -128,7 +129,7 @@ def handle_ivr(
             session["index"] = 0
             if not session["playlist"]:
                 session["state"] = "MAIN_MENU"
-                return make_native_tts_command("יוטיוב חסם זמנית את הבקשה חוזר לתפריט הראשי", "1", "1", 3, "digits")
+                return make_native_tts_command("השירות עמוס זמנית אנא נסו שוב מאוחר יותר חוזר לתפריט הראשי", "1", "1", 3, "digits")
             
             clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
             return f"read=f-{clean_media_url}=ValName,no,1,1,3,digits,no"
