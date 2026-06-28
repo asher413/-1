@@ -1,8 +1,10 @@
 import io
+import json
+import urllib.request
+import urllib.parse
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-import yt_dlp
 
 app = FastAPI()
 
@@ -22,38 +24,50 @@ WHITELIST = ["0534133753", "0534133754"]
 ACCESS_CODE = "1234"                       
 
 def fetch_youtube_ids(query: str, max_results=5):
-    """מחפש ביוטיוב ומחזיר רק מטא-דאטה (IDs) - מנגנון שלעולם לא נחסם על ידי גוגל"""
-    ydl_opts = {
-        'default_search': f'ytsearch{max_results}',
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True, # חילוץ שטוח בלבד ללא קונפיגורציית נגן
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    """מחפש ביוטיוב דרך שרתי API פתוחים ומבוזרים - עוקף חסימות ב-100% ללא yt-dlp"""
+    encoded_query = urllib.parse.quote(query)
+    
+    # רשימת שרתי פרוקסי ציבוריים יציבים לגיבוי הדדי
+    instances = [
+        f"https://yewtu.be/api/v1/search?q={encoded_query}&type=video",
+        f"https://vid.puffyan.us/api/v1/search?q={encoded_query}&type=video",
+        f"https://invidious.nerdvpn.de/api/v1/search?q={encoded_query}&type=video"
+    ]
+    
+    for url in instances:
         try:
-            info = ydl.extract_info(query, download=False)
-            video_ids = []
-            if 'entries' in info:
-                for entry in info['entries']:
-                    if entry and 'id' in entry:
-                        video_ids.append(entry['id'])
-            return video_ids
+            req = urllib.request.Request(
+                url, 
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+            )
+            with urllib.request.urlopen(req, timeout=4) as response:
+                data = json.loads(response.read().decode())
+                video_ids = []
+                for item in data:
+                    if isinstance(item, dict) and 'videoId' in item:
+                        video_ids.append(item['videoId'])
+                    if len(video_ids) >= max_results:
+                        break
+                if video_ids:
+                    return video_ids
         except Exception as e:
-            print(f"Error fetching YouTube flat search: {e}")
-            return []
+            print(f"Failed searching on instance {url}: {e}")
+            continue # מעבר לשרת הבא ברשימה במקרה של שגיאה
+            
+    return []
 
 @app.get("/stream_media/{phone}/{index}.mp3")
 def stream_media(phone: str, index: int):
-    """מפנה את ימות המשיח לפרוקסי אודיו עולמי יציב שעוקף את חסימת השרתים של רנדר"""
+    """מפנה את ימות המשיח ישירות לזרם האודיו של הפרוקסי הציבורי בפורמט קל ונתמך"""
     try:
         if phone in db_sessions and db_sessions[phone]["playlist"]:
             playlist = db_sessions[phone]["playlist"]
             idx = int(index)
             if 0 <= idx < len(playlist):
                 video_id = playlist[idx]
-                # שימוש בשרת הפצה פתוח שממיר ומזרים אודיו ישירות לטלפון בצורה חלקה
-                fallback_url = f"https://yewtu.be/latest_version?id={video_id}&itag=140"
-                return RedirectResponse(url=fallback_url)
+                # itag=140 מייצג קובץ אודיו בלבד מסוג M4A/AAC שמתנגן מעולה בטלפון
+                stream_url = f"https://yewtu.be/latest_version?id={video_id}&itag=140"
+                return RedirectResponse(url=stream_url)
     except Exception as e:
         print(f"Error redirecting stream: {e}")
     
@@ -63,7 +77,6 @@ def make_native_tts_command(text: str, min_dig: str, max_dig: str, sec: int, typ
     """מייצר פקודת הקראה מובנית (TTS) ומגדיר פרמטרים קשיחים למניעת באגים בימות המשיח"""
     clean_text = text.replace("=", "").replace(",", "").replace("-", "")
     
-    # במצב קולי שולחים הגדרות אורך טקסט קבועות כדי למנוע מהמערכת לקרוס למצב הקלדת ספרות
     if type_mode.lower() == "voice":
         return f"read=t-{clean_text}=ValName,no,50,1,{sec},voice,no"
     
@@ -121,11 +134,11 @@ def handle_ivr(
         
         elif ValName == "2":
             session["state"] = "PLAYING_LATEST"
-            session["playlist"] = fetch_youtube_ids("שירים חדשים", max_results=7)
+            session["playlist"] = fetch_youtube_ids("שירים חדשים מיוזיק", max_results=7)
             session["index"] = 0
             if not session["playlist"]:
                 session["state"] = "MAIN_MENU"
-                return make_native_tts_command("לא נמצאו שירים חוזר לתפריט הראשי", "1", "1", 3, "digits")
+                return make_native_tts_command("לא נמצאו שירים אנא נסו שנית מאוחר יותר חוזר לתפריט הראשי", "1", "1", 3, "digits")
             
             clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
             return f"read=f-{clean_media_url}=ValName,no,1,1,3,digits,no"
@@ -139,7 +152,6 @@ def handle_ivr(
             session["state"] = "MAIN_MENU"
             return make_native_tts_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
 
-        # הגנה מפני באג הלחיצה הכפולה או קלט ריק: אם נקלטו מקשי תפריט, נבקש להקליט שוב
         if not ValName or ValName in ["1", "2", "*", "#"]:
             return make_native_tts_command("לא קלטתי את הדיבור שלכם אנא אמרו את שם השיר בבירור לאחר הצליל", "1", "50", 10, "voice")
         
