@@ -111,7 +111,6 @@ def handle_ivr(
     song_ended = request.query_params.get("play_url_end") == "yes"
 
     # 🔥 תיקון ה-Base URL הקריטי עבור Render פרוקסי!
-    # שולף את הכתובת הציבורית האמיתית החיצונית (https://your-app.onrender.com)
     host = request.headers.get("x-forwarded-host", request.url.netloc)
     proto = request.headers.get("x-forwarded-proto", "https")
     base_url = f"{proto}://{host}"
@@ -148,13 +147,17 @@ def handle_ivr(
         
         elif ValName == "2":
             session["state"] = "PLAYING_LATEST"
-            # מחפש מוזיקה חדשה משנת 2026 ומפעיל סינון חודש אחרון קשוח (filter_newest=True)
             session["playlist"] = fetch_youtube_ids("שירים חדשים 2026 מוזיקה חסידית", max_results=30, filter_newest=True)
             session["index"] = 0
             clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
             return f"play_url={clean_media_url}"
+            
+        elif ValName == "3":
+            session["state"] = "PREDEFINED_ARTISTS"
+            return make_native_tts_command("לתפריט החיפוש המוכן מראש: לעומר אדם הקש 1, ליעקב שוואקי הקש 2, לחנן בן ארי הקש 3, לישי ריבו הקש 4. לחזרה הקש 0", "1", "1", 10, "digits")
+            
         else:
-            return make_native_tts_command("לתפריט חיפוש קולי הקש 1 לשירים חדשים ועדכניים הקש 2", "1", "1", 10, "digits")
+            return make_native_tts_command("לתפריט חיפוש קולי הקש 1, לשירים חדשים ועדכניים הקש 2, לחיפוש מהיר מובנה הקש 3", "1", "1", 10, "digits")
 
     # --- חיפוש קולי ---
     elif state == "WAITING_FOR_SEARCH":
@@ -174,7 +177,51 @@ def handle_ivr(
         session["state"] = "MAIN_MENU"
         return make_native_tts_command("ההשמעה הסתיימה חוזר לתפריט הראשי", "1", "1", 3, "digits")
 
-    # --- נגן פלייליסט שירים חדשים ---
+    # --- שלוחה 3: תפריט חיפוש מהיר מובנה ---
+    elif state == "PREDEFINED_ARTISTS":
+        if ValName == "0":
+            session["state"] = "MAIN_MENU"
+            return make_native_tts_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
+            
+        artist_queries = {
+            "1": "עומר אדם כללי",
+            "2": "יעקב שוואקי",
+            "3": "חנן בן ארי",
+            "4": "ישי ריבו"
+        }
+        
+        if ValName in artist_queries:
+            query_text = artist_queries[ValName]
+            results = fetch_youtube_ids(query_text, max_results=30, filter_newest=False)
+            session["playlist"] = results
+            session["state"] = "CHOOSE_TRACK_NUMBER"
+            
+            total_found = len(results)
+            return make_native_tts_command(f"נמצאו {total_found} תוצאות. אנא הקש את מספר השיר המבוקש מאחד עד {total_found} ולאחריו סולמית.", "1", "2", 15, "digits")
+        else:
+            return make_native_tts_command("בחירה שגויה. לעומר אדם הקש 1, ליעקב שוואקי הקש 2, לחנן בן ארי הקש 3, לישי ריבו הקש 4.", "1", "1", 10, "digits")
+
+    # --- בחירת מספר שיר ספציפי מתוך רשימת התוצאות ---
+    elif state == "CHOOSE_TRACK_NUMBER":
+        if ValName == "0":
+            session["state"] = "MAIN_MENU"
+            return make_native_tts_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
+            
+        playlist = session["playlist"]
+        try:
+            chosen_number = int(ValName)
+            if 1 <= chosen_number <= len(playlist):
+                # המרה לאינדקס של רשימה (שיר מספר 1 הוא אינדקס 0)
+                session["index"] = chosen_number - 1
+                session["state"] = "PLAYING_LATEST" # עובר לנגן הרגיל שיודע להמשיך קדימה/אחורה בלולאה
+                clean_media_url = f"{base_url}/stream_media/{ApiPhone}/{session['index']}.mp3"
+                return f"play_url={clean_media_url}"
+            else:
+                return make_native_tts_command(f"מספר מחוץ לטווח. נא הקש מספר בין 1 ל-{len(playlist)}", "1", "2", 10, "digits")
+        except ValueError:
+            return make_native_tts_command("קלט לא תקין. אנא הקש מספר שיר תקין", "1", "2", 10, "digits")
+
+    # --- נגן פלייליסט שירים חדשים / מובנים ---
     elif state == "PLAYING_LATEST":
         playlist = session["playlist"]
         idx = session["index"]
@@ -187,7 +234,7 @@ def handle_ivr(
             session["state"] = "MAIN_MENU"
             return make_native_tts_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
 
-        # 🔥 פתרון הגעה לסוף הפלייליסט: במקום לחזור לתפריט, חוזרים לשיר הראשון בלולאה רציפה!
+        # פתרון הגעה לסוף הפלייליסט: חזרה לשיר הראשון בלולאה רציפה
         if idx >= len(playlist):
             idx = 0 
         elif idx < 0:
