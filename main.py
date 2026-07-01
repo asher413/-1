@@ -18,9 +18,10 @@ app.add_middleware(
 )
 
 # ====================================================================
-# 🔑 הדבק כאן את מפתח ה-API שקיבלת מ-RapidAPI בין הגרשיים:
+# 🔑 מפתח ה-API וההגדרות המעודכנות מהתמונה שלך:
 # ====================================================================
-RAPIDAPI_KEY = "הדבק_כאן_את_המפתח_הארוך_שלך"
+RAPIDAPI_KEY = "b356e0c424msh95c209990ea7472p1fe240jsn2a029b5480bf"
+RAPIDAPI_HOST = "youtube-mp3-audio-video-downloader.p.rapidapi.com"
 # ====================================================================
 
 db_sessions = {}
@@ -31,7 +32,6 @@ def fetch_youtube_ids(query: str, max_results=30, filter_newest=False):
     """מחפש ביוטיוב דרך DuckDuckGo HTML עם תמיכה בסינון לפי התאריך הכי עדכני"""
     encoded_query = urllib.parse.quote(query)
     
-    # אם נדרש סינון שירים חדשים, נפעיל פילטר של החודש האחרון בלבד (df=m)
     date_filter = "&df=m" if filter_newest else ""
     url = f"https://html.duckduckgo.com/html/?q={encoded_query}+site:youtube.com{date_filter}"
     
@@ -63,7 +63,7 @@ def fetch_youtube_ids(query: str, max_results=30, filter_newest=False):
 
 @app.get("/stream_media/{phone}/{index}.mp3")
 def stream_media(phone: str, index: int):
-    """פונה ל-RapidAPI ומחזיר קישור הזרמה ישיר וחסין למוזיקה"""
+    """פונה ל-RapidAPI החדש מהתמונה ומחזיר קישור הזרמה ישיר וחסין"""
     try:
         if phone in db_sessions and db_sessions[phone]["playlist"]:
             playlist = db_sessions[phone]["playlist"]
@@ -71,15 +71,18 @@ def stream_media(phone: str, index: int):
             if 0 <= idx < len(playlist):
                 video_id = playlist[idx]
                 
-                api_url = f"https://youtube-mp36.p.rapidapi.com/dl?id={video_id}"
+                # התאמה למבנה ה-Host וה-Endpoint מהתמונה שלך
+                api_url = f"https://{RAPIDAPI_HOST}/mp3?id={video_id}"
                 req = urllib.request.Request(api_url)
                 req.add_header("x-rapidapi-key", RAPIDAPI_KEY)
-                req.add_header("x-rapidapi-host", "youtube-mp36.p.rapidapi.com")
+                req.add_header("x-rapidapi-host", RAPIDAPI_HOST)
                 
                 with urllib.request.urlopen(req, timeout=8) as response:
                     res_data = json.loads(response.read().decode('utf-8'))
-                    if res_data.get("status") == "ok" and "link" in res_data:
-                        mp3_link = res_data["link"]
+                    
+                    # ניסיון שליפת הקישור מתוך התגובה (תומך במגוון פורמטים של תגובות)
+                    mp3_link = res_data.get("link") or res_data.get("url") or res_data.get("download_url")
+                    if mp3_link:
                         return RedirectResponse(url=mp3_link)
     except Exception as e:
         print(f"RapidAPI streaming link error: {e}")
@@ -110,7 +113,6 @@ def handle_ivr(
 
     song_ended = request.query_params.get("play_url_end") == "yes"
 
-    # 🔥 תיקון ה-Base URL הקריטי עבור Render פרוקסי!
     host = request.headers.get("x-forwarded-host", request.url.netloc)
     proto = request.headers.get("x-forwarded-proto", "https")
     base_url = f"{proto}://{host}"
@@ -211,9 +213,8 @@ def handle_ivr(
         try:
             chosen_number = int(ValName)
             if 1 <= chosen_number <= len(playlist):
-                # המרה לאינדקס של רשימה (שיר מספר 1 הוא אינדקס 0)
                 session["index"] = chosen_number - 1
-                session["state"] = "PLAYING_LATEST" # עובר לנגן הרגיל שיודע להמשיך קדימה/אחורה בלולאה
+                session["state"] = "PLAYING_LATEST" 
                 clean_media_url = f"{base_url}/stream_media/{ApiPhone}/{session['index']}.mp3"
                 return f"play_url={clean_media_url}"
             else:
@@ -234,7 +235,6 @@ def handle_ivr(
             session["state"] = "MAIN_MENU"
             return make_native_tts_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
 
-        # פתרון הגעה לסוף הפלייליסט: חזרה לשיר הראשון בלולאה רציפה
         if idx >= len(playlist):
             idx = 0 
         elif idx < 0:
