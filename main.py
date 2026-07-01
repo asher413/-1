@@ -64,27 +64,52 @@ def fetch_youtube_ids(query: str, max_results=30, filter_newest=False):
     return ["YmK2mZf_uRE", "7un666Y6N_Q", "H762G1UoP2k", "4X7bLks7Oxc"][:max_results]
 
 def get_rapidapi_mp3_url(video_id: str) -> str:
-    """פונה ל-RapidAPI בזמן אמת ומחזירה את קישור ה-MP3 הישיר של ה-CDN"""
+    """פונה ל-RapidAPI עם כותרות דפדפן מלאות ומנסה את כל סוגי ה-Endpoints הנפוצים"""
     endpoints = [
         f"https://{RAPIDAPI_HOST}/mp3?id={video_id}",
+        f"https://{RAPIDAPI_HOST}/download?id={video_id}",
+        f"https://{RAPIDAPI_HOST}/download?url=https://www.youtube.com/watch?v={video_id}",
         f"https://{RAPIDAPI_HOST}/get-mp3-download-link/{video_id}"
     ]
+    
     for api_url in endpoints:
         try:
             req = urllib.request.Request(api_url)
             req.add_header("x-rapidapi-key", RAPIDAPI_KEY)
             req.add_header("x-rapidapi-host", RAPIDAPI_HOST)
+            # הוספת User-Agent קריטית כדי למנוע חסימות 403 ו-429 מצד Cloudflare של RapidAPI
+            req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             
             with urllib.request.urlopen(req, timeout=4) as response:
-                res_data = json.loads(response.read().decode('utf-8'))
-                mp3_link = res_data.get("link") or res_data.get("download_url") or res_data.get("url")
+                res_body = response.read().decode('utf-8')
+                res_data = json.loads(res_body)
+                
+                # חילוץ חכם של הקישור מכל מפתח אפשרי ב-JSON
+                mp3_link = (
+                    res_data.get("link") or 
+                    res_data.get("download_url") or 
+                    res_data.get("url") or 
+                    res_data.get("downloadLink")
+                )
+                
+                # תמיכה במבנה פנימי אם ה-API מחזיר אובייקט nested (בתוך 'result' או 'data')
+                if not mp3_link and isinstance(res_data, dict):
+                    for key in ["result", "data", "info"]:
+                        if key in res_data and isinstance(res_data[key], dict):
+                            inner = res_data[key]
+                            mp3_link = inner.get("link") or inner.get("download_url") or inner.get("url") or inner.get("downloadLink")
+                            if mp3_link:
+                                break
+                                
                 if mp3_link:
+                    print(f"✅ Successfully got MP3 link from RapidAPI: {mp3_link[:50]}...")
                     return mp3_link
         except Exception as e:
             print(f"Endpoint failed ({api_url}): {e}")
             continue
             
-    # קישור גיבוי תקין לחלוטין אם ה-API לא החזיר תשובה בזמן
+    # קובץ גיבוי שעובד תמיד למקרה שאין מנוי פעיל ב-RapidAPI או חסימה מוחלטת
+    print("⚠️ All RapidAPI endpoints failed. Falling back to backup track.")
     return "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
 
 def make_native_tts_command(text: str, min_dig: str, max_dig: str, sec: int, type_mode: str) -> str:
