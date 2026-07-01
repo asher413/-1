@@ -63,25 +63,59 @@ def fetch_youtube_ids(query: str, max_results=30, filter_newest=False):
             
     return ["YmK2mZf_uRE", "7un666Y6N_Q", "H762G1UoP2k", "4X7bLks7Oxc"][:max_results]
 
+def get_cobalt_audio_url(video_id: str) -> str:
+    """מנוע גיבוי אולטרה-מהיר המשתמש ב-Cobalt API הציבורי להזרמת שמע מיידית"""
+    try:
+        url = "https://api.cobalt.tools/api/json"
+        payload = json.dumps({
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "downloadMode": "audio",
+            "audioFormat": "mp3",
+            "audioBitrate": "128"
+        }).encode('utf-8')
+        
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=6) as response:
+            res_data = json.loads(response.read().decode('utf-8'))
+            if "url" in res_data:
+                print(f"🚀 Cobalt Backup Success! Got direct audio stream link.")
+                return res_data["url"]
+    except Exception as e:
+        print(f"Cobalt Backup API try failed: {e}")
+    return None
+
 def get_rapidapi_mp3_url(video_id: str) -> str:
-    """פונה לנתיבים הרשמיים המדויקים של ה-API עם קו תחתון (_) כפי שנדרש"""
+    """פונה ל-RapidAPI ומדפיסה את תת-התשובה ללוג כדי לנתח אותה בזמן אמת"""
     endpoints = [
         f"https://{RAPIDAPI_HOST}/get_mp3_download_link/{video_id}",
         f"https://{RAPIDAPI_HOST}/get_m4a_download_link/{video_id}"
     ]
     
     for api_url in endpoints:
+        endpoint_name = api_url.split('/')[-2]
         try:
             req = urllib.request.Request(api_url)
             req.add_header("x-rapidapi-key", RAPIDAPI_KEY)
             req.add_header("x-rapidapi-host", RAPIDAPI_HOST)
             req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             
-            with urllib.request.urlopen(req, timeout=5) as response:
+            # הגדלת ה-timeout ל-10 שניות כדי לתת לשרת האיטי שלהם זמן לעבד
+            with urllib.request.urlopen(req, timeout=10) as response:
                 res_body = response.read().decode('utf-8')
                 res_data = json.loads(res_body)
                 
-                # חילוץ הקישור לפי מבנה ה-JSON הרשמי של ה-API
+                # הדפסת התגובה הגולמית ללוג כדי שנראה מה השרת מחזיר בפועל
+                print(f"ℹ️ API Raw Response for {endpoint_name}: {res_body}")
+                
                 mp3_link = (
                     res_data.get("link") or 
                     res_data.get("download_url") or 
@@ -89,7 +123,6 @@ def get_rapidapi_mp3_url(video_id: str) -> str:
                     res_data.get("downloadLink")
                 )
                 
-                # תמיכה במבנה פנימי במידה ויש אובייקט nested
                 if not mp3_link and isinstance(res_data, dict):
                     for key in ["result", "data", "info"]:
                         if key in res_data and isinstance(res_data[key], dict):
@@ -99,14 +132,20 @@ def get_rapidapi_mp3_url(video_id: str) -> str:
                                 break
                                 
                 if mp3_link:
-                    print(f"✅ Success! Got working API link: {mp3_link[:50]}...")
+                    print(f"✅ Success! Got RapidAPI link: {mp3_link[:50]}...")
                     return mp3_link
         except Exception as e:
-            print(f"Endpoint failed ({api_url.split('/')[-2]}): {e}")
+            print(f"Endpoint failed ({endpoint_name}): {e}")
             continue
             
-    # גיבוי זמני
-    print("⚠️ Fallback to backup track")
+    # אם ה-RapidAPI נכשל או לקח יותר מדי זמן, עוברים מיידית למנוע הגיבוי המהיר
+    print("⚠️ RapidAPI timed out or format mismatch. Activating Ultra-Fast Cobalt Backup...")
+    cobalt_url = get_cobalt_audio_url(video_id)
+    if cobalt_url:
+        return cobalt_url
+
+    # מוזיקה זמנית רק אם הכל קרס לחלוטין
+    print("❌ All engines failed. Using emergency track.")
     return "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
 
 def make_native_tts_command(text: str, min_dig: str, max_dig: str, sec: int, type_mode: str) -> str:
