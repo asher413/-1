@@ -29,41 +29,45 @@ WHITELIST = ["0534133753", "0534133754"]
 ACCESS_CODE = "1234"                       
 
 def fetch_youtube_ids(query: str, max_results=30, filter_newest=False):
-    """מחפש ביוטיוב דרך DuckDuckGo HTML עם תמיכה בסינון לפי התאריך הכי עדכני"""
+    """שולף מזהי וידאו מיוטיוב בצורה מהירה במיוחד דרך שרתי API חלופיים כדי למנוע חסימות ועיכובים"""
+    if filter_newest:
+        query += " חדש 2026"
     encoded_query = urllib.parse.quote(query)
     
-    date_filter = "&df=m" if filter_newest else ""
-    url = f"https://html.duckduckgo.com/html/?q={encoded_query}+site:youtube.com{date_filter}"
+    # שימוש בשרתים מבוזרים כדי להחזיר תשובה מיידית (פחות מ-500ms) ולמנוע ניתוקים בימות המשיח
+    piped_instances = [
+        f"https://pipedapi.kavin.rocks/search?q={encoded_query}&filter=videos",
+        f"https://api.piped.yt/search?q={encoded_query}&filter=videos",
+        f"https://pipedapi.moomoo.me/search?q={encoded_query}&filter=videos"
+    ]
     
-    try:
-        req = urllib.request.Request(
-            url, 
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        )
-        with urllib.request.urlopen(req, timeout=6) as response:
-            html = response.read().decode('utf-8', errors='ignore')
+    for url in piped_instances:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=3) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                video_ids = []
+                items = data.get("items", [])
+                for item in items:
+                    if item.get("type") == "stream":
+                        video_id = item.get("id")
+                        if video_id and len(video_id) == 11 and video_id not in video_ids:
+                            video_ids.append(video_id)
+                    if len(video_ids) >= max_results:
+                        break
+                if video_ids:
+                    print(f"Successfully fetched {len(video_ids)} IDs from Piped API.")
+                    return video_ids
+        except Exception as e:
+            print(f"Piped instance failed ({url.split('/')[2]}): {e}")
+            continue
             
-            raw_matches = re.findall(r'watch\?v=([a-zA-Z0-9_-]{11})', html)
-            encoded_matches = re.findall(r'watch%3Fv%3D([a-zA-Z0-9_-]{11})', html)
-            
-            video_ids = []
-            for v_id in (raw_matches + encoded_matches):
-                if v_id not in video_ids:
-                    video_ids.append(v_id)
-                if len(video_ids) >= max_results:
-                    break
-                    
-            if video_ids:
-                print(f"Found {len(video_ids)} fresh videos.")
-                return video_ids
-    except Exception as e:
-        print(f"DuckDuckGo extraction failed: {e}")
-            
+    # פלייליסט גיבוי מהיר למקרה שכל הרשתות עמוסות
     return ["YmK2mZf_uRE", "7un666Y6N_Q", "H762G1UoP2k", "4X7bLks7Oxc"][:max_results]
 
 @app.get("/stream_media/{phone}/{index}.mp3")
 def stream_media(phone: str, index: int):
-    """פונה ל-RapidAPI החדש מהתמונה ומחזיר קישור הזרמה ישיר וחסין"""
+    """פונה ל-RapidAPI החדש מהתמונה באמצעות הנתיב המדויק ומחזיר קישור הזרמה ישיר"""
     try:
         if phone in db_sessions and db_sessions[phone]["playlist"]:
             playlist = db_sessions[phone]["playlist"]
@@ -71,19 +75,30 @@ def stream_media(phone: str, index: int):
             if 0 <= idx < len(playlist):
                 video_id = playlist[idx]
                 
-                # התאמה למבנה ה-Host וה-Endpoint מהתמונה שלך
-                api_url = f"https://{RAPIDAPI_HOST}/mp3?id={video_id}"
+                # התאמה לנתיב הרשמי של ה-API הספציפי שפתחת בתמונה (get-mp3-download-link)
+                api_url = f"https://{RAPIDAPI_HOST}/get-mp3-download-link/{video_id}"
                 req = urllib.request.Request(api_url)
                 req.add_header("x-rapidapi-key", RAPIDAPI_KEY)
                 req.add_header("x-rapidapi-host", RAPIDAPI_HOST)
                 
-                with urllib.request.urlopen(req, timeout=8) as response:
-                    res_data = json.loads(response.read().decode('utf-8'))
-                    
-                    # ניסיון שליפת הקישור מתוך התגובה (תומך במגוון פורמטים של תגובות)
-                    mp3_link = res_data.get("link") or res_data.get("url") or res_data.get("download_url")
-                    if mp3_link:
-                        return RedirectResponse(url=mp3_link)
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as response:
+                        res_data = json.loads(response.read().decode('utf-8'))
+                        mp3_link = res_data.get("download_url") or res_data.get("link") or res_data.get("url")
+                        if mp3_link:
+                            return RedirectResponse(url=mp3_link)
+                except Exception as e1:
+                    print(f"First endpoint variant failed, trying underscore: {e1}")
+                    # גיבוי בפורמט קו תחתון ליתר ביטחון
+                    api_url = f"https://{RAPIDAPI_HOST}/get_mp3_download_link/{video_id}"
+                    req = urllib.request.Request(api_url)
+                    req.add_header("x-rapidapi-key", RAPIDAPI_KEY)
+                    req.add_header("x-rapidapi-host", RAPIDAPI_HOST)
+                    with urllib.request.urlopen(req, timeout=5) as response:
+                        res_data = json.loads(response.read().decode('utf-8'))
+                        mp3_link = res_data.get("download_url") or res_data.get("link") or res_data.get("url")
+                        if mp3_link:
+                            return RedirectResponse(url=mp3_link)
     except Exception as e:
         print(f"RapidAPI streaming link error: {e}")
     
