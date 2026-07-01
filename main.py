@@ -29,7 +29,7 @@ WHITELIST = ["0534133753", "0534133754"]
 ACCESS_CODE = "1234"                       
 
 def fetch_youtube_ids(query: str, max_results=30, filter_newest=False):
-    """שולף מזהי וידאו מיוטיוב בתוך פחות מ-400 מילישניות כדי למנוע יציאה מאיזון של ימות המשיח"""
+    """שולף מזהי וידאו מיוטיוב בתוך פחות מ-400 מילישניות"""
     if filter_newest:
         query += " חדש 2026"
     
@@ -44,11 +44,8 @@ def fetch_youtube_ids(query: str, max_results=30, filter_newest=False):
                 'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7'
             }
         )
-        # timeout קצר של 2 שניות לכל היותר כדי שהקו בחיים לא יתנתק
         with urllib.request.urlopen(req, timeout=2) as response:
             html = response.read().decode('utf-8', errors='ignore')
-            
-            # שליפה ישירה מתוך ה-JSON הפנימי של יוטיוב לקבלת מהירות שיא
             found_ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', html)
             
             video_ids = []
@@ -64,42 +61,31 @@ def fetch_youtube_ids(query: str, max_results=30, filter_newest=False):
     except Exception as e:
         print(f"Direct YouTube search failed: {e}")
             
-    # פלייליסט גיבוי מיידי למקרה קיצוני של חסימה רגעית
     return ["YmK2mZf_uRE", "7un666Y6N_Q", "H762G1UoP2k", "4X7bLks7Oxc"][:max_results]
 
-@app.get("/stream_media/{phone}/{index}.mp3")
-def stream_media(phone: str, index: int):
-    """פונה ל-RapidAPI ומחלץ את נתיב ההורדה הישיר לשיר"""
-    try:
-        if phone in db_sessions and db_sessions[phone]["playlist"]:
-            playlist = db_sessions[phone]["playlist"]
-            idx = int(index)
-            if 0 <= idx < len(playlist):
-                video_id = playlist[idx]
-                
-                # תמיכה בפורמט הסטנדרטי והנפוץ ביותר של ה-Host שלך
-                endpoints = [
-                    f"https://{RAPIDAPI_HOST}/mp3?id={video_id}",
-                    f"https://{RAPIDAPI_HOST}/get-mp3-download-link/{video_id}"
-                ]
-                
-                for api_url in endpoints:
-                    try:
-                        req = urllib.request.Request(api_url)
-                        req.add_header("x-rapidapi-key", RAPIDAPI_KEY)
-                        req.add_header("x-rapidapi-host", RAPIDAPI_HOST)
-                        
-                        with urllib.request.urlopen(req, timeout=4) as response:
-                            res_data = json.loads(response.read().decode('utf-8'))
-                            mp3_link = res_data.get("link") or res_data.get("download_url") or res_data.get("url")
-                            if mp3_link:
-                                return RedirectResponse(url=mp3_link)
-                    except Exception:
-                        continue
-    except Exception as e:
-        print(f"RapidAPI streaming link error: {e}")
-    
-    return RedirectResponse(url="https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3")
+def get_rapidapi_mp3_url(video_id: str) -> str:
+    """פונה ל-RapidAPI בזמן אמת ומחזירה את קישור ה-MP3 הישיר של ה-CDN"""
+    endpoints = [
+        f"https://{RAPIDAPI_HOST}/mp3?id={video_id}",
+        f"https://{RAPIDAPI_HOST}/get-mp3-download-link/{video_id}"
+    ]
+    for api_url in endpoints:
+        try:
+            req = urllib.request.Request(api_url)
+            req.add_header("x-rapidapi-key", RAPIDAPI_KEY)
+            req.add_header("x-rapidapi-host", RAPIDAPI_HOST)
+            
+            with urllib.request.urlopen(req, timeout=4) as response:
+                res_data = json.loads(response.read().decode('utf-8'))
+                mp3_link = res_data.get("link") or res_data.get("download_url") or res_data.get("url")
+                if mp3_link:
+                    return mp3_link
+        except Exception as e:
+            print(f"Endpoint failed ({api_url}): {e}")
+            continue
+            
+    # קישור גיבוי תקין לחלוטין אם ה-API לא החזיר תשובה בזמן
+    return "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
 
 def make_native_tts_command(text: str, min_dig: str, max_dig: str, sec: int, type_mode: str) -> str:
     clean_text = text.replace("=", "").replace(",", "").replace("-", "")
@@ -124,10 +110,6 @@ def handle_ivr(
         ValName = request.query_params.get("play_url_pressed")
 
     song_ended = request.query_params.get("play_url_end") == "yes"
-
-    host = request.headers.get("x-forwarded-host", request.url.netloc)
-    proto = request.headers.get("x-forwarded-proto", "https")
-    base_url = f"{proto}://{host}"
 
     if ApiPhone not in db_sessions:
         is_whitelisted = ApiPhone in WHITELIST
@@ -163,8 +145,11 @@ def handle_ivr(
             session["state"] = "PLAYING_LATEST"
             session["playlist"] = fetch_youtube_ids("שירים חדשים מוזיקה חסידית", max_results=30, filter_newest=True)
             session["index"] = 0
-            clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
-            return f"play_url={clean_media_url}"
+            if session["playlist"]:
+                video_id = session["playlist"][0]
+                direct_link = get_rapidapi_mp3_url(video_id)
+                return f"play_url={direct_link}"
+            return make_native_tts_command("לא נמצאו שירים חוזר לתפריט הראשי", "1", "1", 3, "digits")
             
         elif ValName == "3":
             session["state"] = "PREDEFINED_ARTISTS"
@@ -184,8 +169,13 @@ def handle_ivr(
         session["state"] = "PLAYING_SEARCH"
         session["playlist"] = fetch_youtube_ids(ValName, max_results=1, filter_newest=False)
         session["index"] = 0
-        clean_media_url = f"{base_url}/stream_media/{ApiPhone}/0.mp3"
-        return f"play_url={clean_media_url}"
+        if session["playlist"]:
+            video_id = session["playlist"][0]
+            direct_link = get_rapidapi_mp3_url(video_id)
+            return f"play_url={direct_link}"
+        else:
+            session["state"] = "MAIN_MENU"
+            return make_native_tts_command("לא נמצאו תוצאות חוזר לתפריט הראשי", "1", "1", 3, "digits")
 
     elif state == "PLAYING_SEARCH":
         session["state"] = "MAIN_MENU"
@@ -227,10 +217,11 @@ def handle_ivr(
             if 1 <= chosen_number <= len(playlist):
                 session["index"] = chosen_number - 1
                 session["state"] = "PLAYING_LATEST" 
-                clean_media_url = f"{base_url}/stream_media/{ApiPhone}/{session['index']}.mp3"
-                return f"play_url={clean_media_url}"
+                video_id = playlist[session["index"]]
+                direct_link = get_rapidapi_mp3_url(video_id)
+                return f"play_url={direct_link}"
             else:
-                return make_native_tts_command(f"מספר מחוץ לתווח. נא הקש מספר בין 1 ל-{len(playlist)}", "1", "2", 10, "digits")
+                return make_native_tts_command(f"מספר מחוץ לטווח. נא הקש מספר בין 1 ל-{len(playlist)}", "1", "2", 10, "digits")
         except ValueError:
             return make_native_tts_command("קלט לא תקין. אנא הקש מספר שיר תקין", "1", "2", 10, "digits")
 
@@ -239,11 +230,13 @@ def handle_ivr(
         playlist = session["playlist"]
         idx = session["index"]
 
-        if ValName == "1" or song_ended or not ValName:
+        pressed_key = ValName or request.query_params.get("play_url_pressed")
+
+        if pressed_key == "1" or song_ended:
             idx += 1
-        elif ValName == "2":
+        elif pressed_key == "2":
             idx -= 1
-        elif ValName == "0":
+        elif pressed_key == "0":
             session["state"] = "MAIN_MENU"
             return make_native_tts_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
 
@@ -253,7 +246,10 @@ def handle_ivr(
             idx = len(playlist) - 1 
 
         session["index"] = idx
-        clean_media_url = f"{base_url}/stream_media/{ApiPhone}/{idx}.mp3"
-        return f"play_url={clean_media_url}"
+        if playlist:
+            video_id = playlist[idx]
+            direct_link = get_rapidapi_mp3_url(video_id)
+            return f"play_url={direct_link}"
+        return make_native_tts_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
 
     return "hangup"
