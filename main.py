@@ -64,14 +64,12 @@ def fetch_youtube_ids(query: str, max_results=30, filter_newest=False):
     return ["YmK2mZf_uRE", "7un666Y6N_Q", "H762G1UoP2k", "4X7bLks7Oxc"][:max_results]
 
 def get_cobalt_audio_url(video_id: str) -> str:
-    """מנוע גיבוי אולטרה-מהיר המשתמש ב-Cobalt API הציבורי להזרמת שמע מיידית"""
+    """מנוע גיבוי המשתמש ב-Cobalt API הציבורי בפורמט מעודכן"""
     try:
         url = "https://api.cobalt.tools/api/json"
         payload = json.dumps({
             "url": f"https://www.youtube.com/watch?v={video_id}",
-            "downloadMode": "audio",
-            "audioFormat": "mp3",
-            "audioBitrate": "128"
+            "audioOnly": True
         }).encode('utf-8')
         
         req = urllib.request.Request(
@@ -84,21 +82,24 @@ def get_cobalt_audio_url(video_id: str) -> str:
             },
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=6) as response:
+        with urllib.request.urlopen(req, timeout=5) as response:
             res_data = json.loads(response.read().decode('utf-8'))
             if "url" in res_data:
-                print(f"🚀 Cobalt Backup Success! Got direct audio stream link.")
+                print(f"🚀 Cobalt Backup Success!")
                 return res_data["url"]
     except Exception as e:
-        print(f"Cobalt Backup API try failed: {e}")
+        print(f"Cobalt Backup failed: {e}")
     return None
 
 def get_rapidapi_mp3_url(video_id: str) -> str:
-    """פונה ל-RapidAPI ומדפיסה את תת-התשובה ללוג כדי לנתח אותה בזמן אמת"""
+    """פונה ל-RapidAPI ומחלצת את הקישור מתוך מפתח 'file' שנמצא בלוגים"""
+    # שמנו את m4a ראשון כי הוא מוכן מיידית בשרת שלהם ללא המתנה!
     endpoints = [
-        f"https://{RAPIDAPI_HOST}/get_mp3_download_link/{video_id}",
-        f"https://{RAPIDAPI_HOST}/get_m4a_download_link/{video_id}"
+        f"https://{RAPIDAPI_HOST}/get_m4a_download_link/{video_id}",
+        f"https://{RAPIDAPI_HOST}/get_mp3_download_link/{video_id}"
     ]
+    
+    backup_link = None
     
     for api_url in endpoints:
         endpoint_name = api_url.split('/')[-2]
@@ -106,45 +107,47 @@ def get_rapidapi_mp3_url(video_id: str) -> str:
             req = urllib.request.Request(api_url)
             req.add_header("x-rapidapi-key", RAPIDAPI_KEY)
             req.add_header("x-rapidapi-host", RAPIDAPI_HOST)
-            req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             
-            # הגדלת ה-timeout ל-10 שניות כדי לתת לשרת האיטי שלהם זמן לעבד
             with urllib.request.urlopen(req, timeout=10) as response:
                 res_body = response.read().decode('utf-8')
                 res_data = json.loads(res_body)
                 
-                # הדפסת התגובה הגולמית ללוג כדי שנראה מה השרת מחזיר בפועל
-                print(f"ℹ️ API Raw Response for {endpoint_name}: {res_body}")
-                
+                # חילוץ המפתח המדויק 'file' או 'reserved_file' מהלוגים שלך
                 mp3_link = (
+                    res_data.get("file") or 
+                    res_data.get("reserved_file") or
                     res_data.get("link") or 
-                    res_data.get("download_url") or 
-                    res_data.get("url") or 
-                    res_data.get("downloadLink")
+                    res_data.get("url")
                 )
                 
-                if not mp3_link and isinstance(res_data, dict):
-                    for key in ["result", "data", "info"]:
-                        if key in res_data and isinstance(res_data[key], dict):
-                            inner = res_data[key]
-                            mp3_link = inner.get("link") or inner.get("download_url") or inner.get("url") or inner.get("downloadLink")
-                            if mp3_link:
-                                break
-                                
+                comment = res_data.get("comment", "")
+                
+                # אם הקובץ עדיין דורש זמן עיבוד (מצב של 20-300 שניות ב-MP3)
+                if "soon be ready" in comment:
+                    print(f"⚠️ {endpoint_name} is not ready yet (needs conversion time). Checking alternative...")
+                    if mp3_link:
+                        backup_link = mp3_link  # נשמור בצד ליתר ביטחון
+                    continue
+                
                 if mp3_link:
-                    print(f"✅ Success! Got RapidAPI link: {mp3_link[:50]}...")
+                    print(f"✅ Success! Got active link from {endpoint_name}: {mp3_link[:50]}...")
                     return mp3_link
+                    
         except Exception as e:
             print(f"Endpoint failed ({endpoint_name}): {e}")
             continue
             
-    # אם ה-RapidAPI נכשל או לקח יותר מדי זמן, עוברים מיידית למנוע הגיבוי המהיר
-    print("⚠️ RapidAPI timed out or format mismatch. Activating Ultra-Fast Cobalt Backup...")
+    if backup_link:
+        print("⚠️ Using the non-ready backup link since no immediate file was found.")
+        return backup_link
+        
+    # מעבר למערכת הגיבוי אם הכל נכשל
+    print("⚠️ RapidAPI failed. Trying Cobalt engine...")
     cobalt_url = get_cobalt_audio_url(video_id)
     if cobalt_url:
         return cobalt_url
 
-    # מוזיקה זמנית רק אם הכל קרס לחלוטין
     print("❌ All engines failed. Using emergency track.")
     return "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
 
