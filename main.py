@@ -195,7 +195,7 @@ def init_db() -> None:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_favorites_phone ON favorites(phone)")
 
-        for ph in DEFAULT_WHITELIST = ["0534133753", "0534133754"]
+        for ph in DEFAULT_WHITELIST:
             if PHONE_RE.match(ph):
                 cursor.execute(
                     "INSERT OR IGNORE INTO users (phone, authorized, access_code) VALUES (?, 1, ?)",
