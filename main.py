@@ -47,7 +47,7 @@ DEFAULT_WHITELIST = [p.strip() for p in _whitelist_env.split(",") if p.strip()]
 # קוד גישה קבוע (לא מתחלף בכל ריסטארט!) — חובה להגדיר ב-ENV בפרודקשן.
 # אם לא הוגדר, מייצרים קוד רנדומלי חד-פעמי ומדפיסים ללוג כדי שלא "ייעלם" בלי תיעוד.
 DEFAULT_ACCESS_CODE = os.environ.get("IVR_DEFAULT_ACCESS_CODE")
-if not DEFAULT_ACCESS_CODE:
+if not DEFAULT_ACCESS_CODE:1234
     DEFAULT_ACCESS_CODE = secrets.token_hex(2)
     logger.warning(
         "IVR_DEFAULT_ACCESS_CODE not set! Generated a random one-time code: %s "
