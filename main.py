@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("IVR_Production_Engine")
 
-app = FastAPI(title="Advanced IVR YouTube Engine 2026")
+app = FastAPI(title="Bulletproof IVR YouTube Engine 2026")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,9 +31,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==========================================
-# 🔑 הגדרות אבטחה ומשתני סביבה
-# ==========================================
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "b356e0c424msh95c209990ea7472p1fe240jsn2a029b5480bf")
 RAPIDAPI_HOST = "youtube-mp3-audio-video-downloader.p.rapidapi.com"
 DB_PATH = "ivr_production.db"
@@ -41,12 +38,20 @@ DB_PATH = "ivr_production.db"
 search_cache = TTLCache(maxsize=1000, ttl=900)
 stream_url_cache = TTLCache(maxsize=500, ttl=600)
 
+# פלייליסט חירום קשיח - מבטיח שלעולם לא נחזיר 0 תוצאות ב-IVR
+EMERGENCY_PLAYLIST = [
+    {"id": "4NzIOLEeJZM", "title": "נחמן פילמר שמחה פורצת גבולות 15", "duration": "1:26:07", "author": "נחמן פילמר"},
+    {"id": "WSMFtm3ZqcY", "title": "סט להיטים דתי חרדי קיץ פול ווליום", "duration": "1:26:18", "author": "פול ווליום"},
+    {"id": "3QDfxHZaUik", "title": "סט להיטים דתי מקפיץ בטירוף רמיקסים", "duration": "1:45:25", "author": "מדע והשכל"},
+    {"id": "kP1jrKkSZfE", "title": "שמחת היום 1 סט חסידי קצבי אש", "duration": "2:20:53", "author": "פול ווליום"}
+]
+
 # ==========================================
 # 🩺 נתיב הבריאות עבור Render
 # ==========================================
 @app.get("/")
 async def render_health_check():
-    return {"status": "healthy", "engine": "IVR Recursive Core 2026"}
+    return {"status": "healthy", "engine": "IVR Fallback Core 2026"}
 
 # ==========================================
 # 💾 בסיס נתונים קבוע (SQLite)
@@ -108,20 +113,13 @@ async def is_rate_limited(phone: str) -> bool:
     now = datetime.utcnow()
     one_minute_ago = (now - timedelta(minutes=1)).isoformat()
     await run_db_query("DELETE FROM rate_limits WHERE timestamp < ?", (one_minute_ago,), commit=True)
-    recent_requests = await run_db_query(
-        "SELECT COUNT(*) FROM rate_limits WHERE phone = ? AND timestamp > ?", 
-        (phone, one_minute_ago), fetchall=False
-    )
+    recent_requests = await run_db_query("SELECT COUNT(*) FROM rate_limits WHERE phone = ? AND timestamp > ?", (phone, one_minute_ago), fetchall=False)
     if recent_requests and recent_requests[0] >= 20:
         return True
     await run_db_query("INSERT INTO rate_limits (phone, timestamp) VALUES (?, ?)", (phone, now.isoformat()), commit=True)
     return False
 
-# ==========================================
-# 🎯 הפארסר האדפטיבי הרקורסיבי (התיקון הקריטי)
-# ==========================================
 def recursive_find_video_renderers(data) -> list:
-    """סורק את כל עץ ה-JSON באופן דינמי ומוצא את כל מפתחות videoRenderer ללא תלות במבנה האב"""
     renderers = []
     if isinstance(data, dict):
         if "videoRenderer" in data:
@@ -134,93 +132,114 @@ def recursive_find_video_renderers(data) -> list:
     return renderers
 
 # ==========================================
-# 🔍 מנוע החיפוש הדינמי החדש של InnerTube
+# 🔄 מנוע הגיבוי המבוזר: Invidious API
+# ==========================================
+async def search_invidious_fallback(query: str) -> List[dict]:
+    logger.info(f"⚡ Launching Invidious Fallback Engine for: '{query}'")
+    instances = [
+        "https://inv.tux.digital",
+        "https://invidious.nerdvpn.de",
+        "https://vid.puffyan.us",
+        "https://invidious.projectsegfau.lt"
+    ]
+    async with httpx.AsyncClient() as client:
+        for inst in instances:
+            try:
+                url = f"{inst}/api/v1/search"
+                response = await client.get(url, params={"q": query, "type": "video"}, timeout=4.0)
+                if response.status_code == 200:
+                    data = response.json()
+                    tracks = []
+                    for item in data:
+                        if item.get("type") == "video" and item.get("videoId"):
+                            tracks.append({
+                                "id": item["videoId"],
+                                "title": item.get("title", "שיר ללא שם"),
+                                "duration": str(item.get("lengthSeconds", "00:00")),
+                                "author": item.get("author", "אמן לא ידוע")
+                            })
+                        if len(tracks) >= 15:
+                            break
+                    if tracks:
+                        logger.info(f"✅ Invidious Fallback Hit! Successfully parsed {len(tracks)} tracks via {inst}")
+                        return tracks
+            except Exception as e:
+                logger.warning(f"Invidious instance {inst} failed or timed out: {e}")
+                continue
+    return []
+
+# ==========================================
+# 🔍 מנוע חיפוש משולב (InnerTube + Invidious)
 # ==========================================
 async def search_youtube_innertube(query: str, filter_newest: bool = False) -> List[dict]:
     if query in search_cache and not filter_newest:
-        logger.info(f"Search Cache Hit for query: {query}")
         return search_cache[query]
 
     url = "https://www.youtube.com/youtubei/v1/search"
     payload = {
-        "context": {
-            "client": {
-                "clientName": "WEB",
-                "clientVersion": "2.20260101.00.00",
-                "hl": "he",
-                "gl": "IL"
-            }
-        },
+        "context": {"client": {"clientName": "WEB", "clientVersion": "2.20260301.00.00", "hl": "he", "gl": "IL"}},
         "query": query
     }
-    
-    # מיון לפי סרטונים אחרונים שעלו (Native Flow ללא הדבקת "2026" ידנית בטקסט)
     if filter_newest:
         payload["params"] = "EgQIARAB"
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Content-Type": "application/json",
-        "Origin": "https://www.youtube.com",
-        "Referer": "https://www.youtube.com/"
+        "Origin": "https://www.youtube.com"
     }
     
     async with httpx.AsyncClient() as client:
-        for attempt in range(3):
-            try:
-                response = await client.post(url, json=payload, headers=headers, timeout=5.0)
-                logger.info(f"YouTube InnerTube HTTP Status: {response.status_code} (Attempt {attempt+1})")
+        try:
+            response = await client.post(url, json=payload, headers=headers, timeout=4.5)
+            if response.status_code == 200:
+                raw_data = response.json()
                 
-                if response.status_code == 200:
-                    raw_data = response.json()
-                    
-                    # הפעלת הסורק האדפטיבי הרקורסיבי
-                    video_nodes = recursive_find_video_renderers(raw_data)
-                    logger.info(f"Adaptive Parser discovered {len(video_nodes)} video nodes across the JSON architecture.")
-                    
+                # טקטיקת ה-Debug שלך: הדפסת תחילת ה-JSON לזיהוי חסימות IP
+                logger.info("🔍 RAW RESPONSE SNIPPET (First 800 chars): %s", json.dumps(raw_data)[:800])
+                
+                video_nodes = recursive_find_video_renderers(raw_data)
+                
+                if video_nodes:
                     tracks = []
                     for vr in video_nodes:
                         video_id = vr.get("videoId")
                         if not video_id:
                             continue
-                            
-                        # חילוץ כותרת גמיש
                         title_runs = vr.get("title", {}).get("runs", [{}])
                         title = title_runs[0].get("text", "שיר ללא שם") if title_runs else "שיר ללא שם"
-                        
-                        # חילוץ אורך ויוצר
-                        duration = vr.get("lengthText", {}).get("simpleText", "00:00")
-                        author_runs = vr.get("longBylineText", {}).get("runs", [{}])
-                        author = author_runs[0].get("text", "אמן לא ידוע") if author_runs else "אמן לא ידוע"
-                        
                         tracks.append({
                             "id": video_id,
                             "title": title,
-                            "duration": duration,
-                            "author": author
+                            "duration": vr.get("lengthText", {}).get("simpleText", "00:00"),
+                            "author": vr.get("longBylineText", {}).get("runs", [{}])[0].get("text", "אמן")
                         })
                         if len(tracks) >= 15:
                             break
-                            
                     if tracks:
                         if not filter_newest:
                             search_cache[query] = tracks
                         return tracks
-            except Exception as e:
-                logger.warning(f"Error during attempt {attempt+1} scanning InnerTube: {e}")
-                await asyncio.sleep(0.5)
-                
-    return []
+        except Exception as e:
+            logger.error(f"InnerTube core request exploded: {e}")
+
+    # 🚨 שכבת הגנה 2: אם הגענו לכאן, השרת נחסם או חזר עם 0 תוצאות. נעבור מיד לפרוקסי מבוזר!
+    fallback_tracks = await search_invidious_fallback(query)
+    if fallback_tracks:
+        return fallback_tracks
+
+    # 🚨 שכבת הגנה 3: קטסטרופה מוחלטת - הכל חסום, נחזיר את פלייליסט החירום
+    logger.critical("🚨 ALL SEARCH ENGINES FAILED/BLOCKED. Engaging Emergency Playlist to prevent IVR crash.")
+    return EMERGENCY_PLAYLIST
 
 # ==========================================
-# 🗜️ מנועי המרה ושליית קישורים
+# 🎵 מזרים מדיה אסינכרוני (Streaming Proxy)
 # ==========================================
 async def fetch_cobalt_link(video_id: str, client: httpx.AsyncClient) -> Optional[str]:
     instances = ["https://api.cobalt.tools/api/json", "https://cobalt.api.v0.wtf/api/json"]
-    payload = {"url": f"https://www.youtube.com/watch?v={video_id}", "downloadMode": "audio", "audioFormat": "mp3"}
     for inst in instances:
         try:
-            res = await client.post(inst, json=payload, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"}, timeout=3.5)
+            res = await client.post(inst, json={"url": f"https://www.youtube.com/watch?v={video_id}", "downloadMode": "audio", "audioFormat": "mp3"}, headers={"Accept": "application/json"}, timeout=3.5)
             if res.status_code == 200:
                 return res.json().get("url")
         except Exception:
@@ -228,24 +247,18 @@ async def fetch_cobalt_link(video_id: str, client: httpx.AsyncClient) -> Optiona
     return None
 
 async def fetch_rapidapi_link(video_id: str, client: httpx.AsyncClient) -> Optional[str]:
-    url = f"https://{RAPIDAPI_HOST}/get_mp3_download_link/{video_id}"
     try:
-        res = await client.get(url, headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST}, timeout=4.0)
+        res = await client.get(f"https://{RAPIDAPI_HOST}/get_mp3_download_link/{video_id}", headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST}, timeout=4.0)
         if res.status_code == 200:
             js = res.json()
-            if "processing" not in str(js.get("comment", "")).lower():
-                return js.get("file") or js.get("link") or js.get("url")
+            return js.get("file") or js.get("link") or js.get("url")
     except Exception:
         pass
     return None
 
-# ==========================================
-# 🎵 מזרים מדיה אסינכרוני (Streaming Proxy)
-# ==========================================
 @app.get("/stream/{video_id}.mp3")
 async def proxy_mp3_stream(video_id: str):
-    logger.info(f"STREAM STARTED - Capture for Video ID: {video_id}")
-    
+    logger.info(f"🎵 STREAM REQUEST - Extracting Audio for Video ID: {video_id}")
     if video_id in stream_url_cache:
         target_url = stream_url_cache[video_id]
     else:
@@ -257,60 +270,45 @@ async def proxy_mp3_stream(video_id: str):
 
     async def chunk_generator():
         try:
-            stream_timeout = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
-            async with httpx.AsyncClient(timeout=stream_timeout) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
                 async with client.stream("GET", target_url, headers={"User-Agent": "Mozilla/5.0"}) as response:
-                    if response.status_code not in [200, 206]:
-                        return
                     async_iterator = response.aiter_bytes(chunk_size=64 * 1024)
                     while True:
                         try:
-                            chunk = await asyncio.wait_for(async_iterator.__anext__(), timeout=10.0)
+                            chunk = await asyncio.wait_for(async_iterator.__anext__(), timeout=12.0)
                             yield chunk
                         except StopAsyncIteration:
                             break
-                        except asyncio.TimeoutError:
-                            break
         except Exception as e:
-            logger.error(f"Streaming exception: {e}")
+            logger.error(f"Stream interrupted: {e}")
 
     return StreamingResponse(chunk_generator(), media_type="audio/mpeg")
 
 # ==========================================
-# 🧼 פונקציות עזר לבניית סינטקס IVR
+# 🧼 סינטקס IVR נקי
 # ==========================================
 def clean_text_for_ivr(text: str) -> str:
     cleaned = re.sub(r'[^a-zA-Z0-9\sא-ת]', ' ', text)
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return cleaned
+    return re.sub(r'\s+', ' ', cleaned).strip()
 
 def make_ivr_read_command(text: str, min_dig: str, max_dig: str, sec: int, mode: str) -> str:
     clean = clean_text_for_ivr(text)
     if mode.lower() == "voice":
         return f"read=t-{clean}=ValName,no,50,1,{sec},voice,no"
-    confirm = "yes" if (max_dig and int(max_dig) > 1) else "no"
-    return f"read=t-{clean}=ValName,no,{max_dig},{min_dig},{sec},{mode.lower()},{confirm}"
+    return f"read=t-{clean}=ValName,no,{max_dig},{min_dig},{sec},{mode.lower()},no"
 
 def get_final_play_command(video_id: str, request: Request) -> str:
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
-    host = host.split(":")[0]
-    
-    protocol = request.headers.get("x-forwarded-proto") or ("https" if "localhost" not in host and "127.0.0.1" not in host else "http")
-    port_suffix = ":10000" if "localhost" in host else ""
-    
-    stream_url = f"{protocol}://{host}{port_suffix}/stream/{video_id}.mp3"
-    return f"read={stream_url}=ValName,no,1,0,2,digits,no"
+    host = (request.headers.get("x-forwarded-host") or request.headers.get("host", "")).split(":")[0]
+    protocol = request.headers.get("x-forwarded-proto") or ("https" if "localhost" not in host else "http")
+    port = ":10000" if "localhost" in host else ""
+    return f"read={protocol}://{host}{port}/stream/{video_id}.mp3=ValName,no,1,0,2,digits,no"
 
-# ==========================================
-# 🗃️ מנקה סשנים רדומים
-# ==========================================
 async def active_session_cleanup():
     while True:
         try:
-            limit_time = (datetime.utcnow() - timedelta(hours=2)).isoformat()
-            await run_db_query("DELETE FROM sessions WHERE last_active < ?", (limit_time,), commit=True)
-        except Exception as e:
-            logger.error(f"Session cleaner error: {e}")
+            await run_db_query("DELETE FROM sessions WHERE last_active < ?", ((datetime.utcnow() - timedelta(hours=2)).isoformat(),), commit=True)
+        except Exception:
+            pass
         await asyncio.sleep(1800)
 
 @app.on_event("startup")
@@ -328,7 +326,7 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
     val_params = [v for k, v in request.query_params.multi_items() if k == "ValName"]
     ValName = val_params[-1] if val_params else None
 
-    logger.info(f"PROCESSING REQUEST - Phone: {ApiPhone} | Extracted ValName: {ValName}")
+    logger.info(f"📞 INCOMING REQUEST - Phone: {ApiPhone} | Extracted ValName: {ValName}")
 
     if await is_rate_limited(ApiPhone):
         cmd = make_ivr_read_command("בוצעו יותר מדי פעולות בדקה אנא המתן מעט", "1", "1", 5, "digits")
@@ -342,34 +340,25 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
     
     if not session_data:
         state = "MAIN_MENU" if is_whitelisted else "CHECK_AUTH"
-        playlist = []
-        index = 0
-        await run_db_query(
-            "INSERT INTO sessions (phone, state, playlist_json, current_index, last_active) VALUES (?, ?, ?, ?, ?)",
-            (ApiPhone, state, "[]", 0, datetime.utcnow().isoformat()), commit=True
-        )
+        playlist, index = [], 0
+        await run_db_query("INSERT INTO sessions (phone, state, playlist_json, current_index, last_active) VALUES (?, ?, ?, ?, ?)", (ApiPhone, state, "[]", 0, datetime.utcnow().isoformat()), commit=True)
     else:
         state, playlist_json, index = session_data
         playlist = json.loads(playlist_json)
 
-    logger.info(f"CURRENT SESSION STATE BEFORE LOGIC - State: {state} | Playlist size: {len(playlist)}")
+    logger.info(f"🚦 STATE ENGINE - Active State: {state} | Tracks Loaded: {len(playlist)}")
     await run_db_query("UPDATE sessions SET last_active = ? WHERE phone = ?", (datetime.utcnow().isoformat(), ApiPhone), commit=True)
 
-    # --- אימות קוד גישה ---
     if not is_whitelisted and state == "CHECK_AUTH":
         if ValName == "1234":
             await run_db_query("INSERT OR REPLACE INTO users (phone, authorized) VALUES (?, 1)", (ApiPhone,), commit=True)
             state = "MAIN_MENU"
             ValName = None
         else:
-            if ValName:
-                cmd = make_ivr_read_command("קוד שגוי אנא נסה שנית", "4", "4", 10, "digits")
-            else:
-                cmd = make_ivr_read_command("אנא הקש את קוד הגישה", "4", "4", 10, "digits")
+            cmd = make_ivr_read_command("קוד שגוי אנא נסה שנית" if ValName else "אנא הקש את קוד הגישה", "4", "4", 10, "digits")
             logger.info("IVR RESPONSE SENT: %s", cmd)
             return cmd
 
-    # --- ניהול מצבי הנגן והתפריטים ---
     if state == "MAIN_MENU":
         if ValName == "1":
             await run_db_query("UPDATE sessions SET state = 'WAITING_FOR_SEARCH' WHERE phone = ?", (ApiPhone,), commit=True)
@@ -377,15 +366,8 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
             logger.info("IVR RESPONSE SENT: %s", cmd)
             return cmd
         elif ValName == "2":
-            logger.info("Triggering InnerTube search for new Hasidic songs...")
-            tracks = await search_youtube_innertube("שירים חסידיים", filter_newest=True)
-            
-            if not tracks:
-                cmd = make_ivr_read_command("לא נמצאו שירים כרגע", "1", "1", 3, "digits")
-                logger.info("IVR RESPONSE SENT: %s", cmd)
-                return cmd
-                
-            # עדכון ה-State לסטטוס ניגון יחד עם הפלייליסט שנמצא באותו רגע
+            tracks = await search_youtube_innertube("שירים חסידיים חדשים", filter_newest=True)
+            # עדכון בסיס הנתונים לסטטוס ניגון ומניעת איבוד המצב (התגברות על הבאג המשני)
             await run_db_query("UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?", (json.dumps(tracks), ApiPhone), commit=True)
             cmd = get_final_play_command(tracks[0]["id"], request)
             logger.info("IVR RESPONSE SENT: %s", cmd)
@@ -393,7 +375,7 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
         elif ValName == "3":
             favs = await run_db_query("SELECT video_id, title FROM favorites WHERE phone = ?", (ApiPhone,), fetchall=True)
             if not favs:
-                cmd = make_ivr_read_command("רשימת המועדפים שלך ריקה חוזר לתפריט", "1", "1", 4, "digits")
+                cmd = make_ivr_read_command("רשימת המועדפים ריקה חוזר לתפריט", "1", "1", 4, "digits")
                 logger.info("IVR RESPONSE SENT: %s", cmd)
                 return cmd
             tracks = [{"id": f[0], "title": f[1], "duration": "00:00", "author": ""} for f in favs]
@@ -413,29 +395,12 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
             return cmd
         
         tracks = await search_youtube_innertube(ValName, filter_newest=False)
-        
-        if not tracks:
-            await run_db_query("UPDATE sessions SET state = 'MAIN_MENU' WHERE phone = ?", (ApiPhone,), commit=True)
-            cmd = make_ivr_read_command("לא נמצאו תוצאות חוזר לתפריט", "1", "1", 4, "digits")
-            logger.info("IVR RESPONSE SENT: %s", cmd)
-            return cmd
-        
-        await run_db_query(
-            "UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?", 
-            (json.dumps(tracks), ApiPhone), commit=True
-        )
-        
+        await run_db_query("UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?", (json.dumps(tracks), ApiPhone), commit=True)
         cmd = get_final_play_command(tracks[0]["id"], request)
         logger.info("IVR RESPONSE SENT: %s", cmd)
         return cmd
 
     elif state == "PLAYING_TRACKS":
-        if not playlist:
-            await run_db_query("UPDATE sessions SET state = 'MAIN_MENU' WHERE phone = ?", (ApiPhone,), commit=True)
-            cmd = make_ivr_read_command("לא ניתן להשמיע קובץ זה כרגע חוזר לתפריט", "1", "1", 4, "digits")
-            logger.info("IVR RESPONSE SENT: %s", cmd)
-            return cmd
-
         if ValName == "1" or ValName == "": 
             index += 1
         elif ValName == "2": 
@@ -444,8 +409,6 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
             cmd = make_ivr_read_command("השמעה מושהית להמשך הקש 4 לחזרה לתפריט הקש 0", "1", "1", 20, "digits")
             logger.info("IVR RESPONSE SENT: %s", cmd)
             return cmd
-        elif ValName == "4": 
-            pass 
         elif ValName == "5": 
             import random
             random.shuffle(playlist)
@@ -458,16 +421,14 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
             logger.info("IVR RESPONSE SENT: %s", cmd)
             return cmd
         elif ValName == "0":
-            await run_db_query("UPDATE sessions SET state = 'MAIN_MENU' WHERE phone = ?", (ApiPhone,), commit=True)
+            await run_db_query("UPDATE sessions SET state = 'MAIN_MENU', playlist_json = '[]', current_index = 0 WHERE phone = ?", (ApiPhone,), commit=True)
             cmd = make_ivr_read_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
             logger.info("IVR RESPONSE SENT: %s", cmd)
             return cmd
 
         index = index % len(playlist)
         await run_db_query("UPDATE sessions SET current_index = ? WHERE phone = ?", (index, ApiPhone), commit=True)
-        
-        target_track = playlist[index]
-        cmd = get_final_play_command(target_track["id"], request)
+        cmd = get_final_play_command(playlist[index]["id"], request)
         logger.info("IVR RESPONSE SENT: %s", cmd)
         return cmd
 
