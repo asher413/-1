@@ -44,13 +44,17 @@ DB_PATH = os.environ.get("IVR_DB_PATH", "ivr_production.db")
 _whitelist_env = os.environ.get("IVR_WHITELIST_PHONES", "")
 DEFAULT_WHITELIST = [p.strip() for p in _whitelist_env.split(",") if p.strip()]
 
-# קוד גישה קבוע (לא מתחלף בכל ריסטארט!) — חובה להגדיר ב-ENV בפרודקשן.
-# אם לא הוגדר, מייצרים קוד רנדומלי חד-פעמי ומדפיסים ללוג כדי שלא "ייעלם" בלי תיעוד.
+# קוד גישה קבוע — חובה להגדיר ב-ENV בפרודקשן.
+# אם לא הוגדר ב-ENV, המערכת תשתמש בקוד ברירת המחדל "1234"
 DEFAULT_ACCESS_CODE = os.environ.get("IVR_DEFAULT_ACCESS_CODE")
-if not DEFAULT_ACCESS_CODE = "1234"
-    DEFAULT_ACCESS_CODE = secrets.token_hex(2)
+if not DEFAULT_ACCESS_CODE:
+    DEFAULT_ACCESS_CODE = "1234"  # הגדרת קוד ברירת מחדל קבוע ותקין בגרשיים
+    
+    # הערה: אם תעדיף קוד אקראי שמתחלף בכל הפעלה, החלף את השורה למעלה ב:
+    # DEFAULT_ACCESS_CODE = secrets.token_hex(2)
+    
     logger.warning(
-        "IVR_DEFAULT_ACCESS_CODE not set! Generated a random one-time code: %s "
+        "IVR_DEFAULT_ACCESS_CODE not set! Using default access code: %s "
         "— set this env var explicitly in production so it doesn't change on restart.",
         DEFAULT_ACCESS_CODE,
     )
