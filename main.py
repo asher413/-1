@@ -7,13 +7,13 @@ import sqlite3
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
-from fastapi import FastAPI, Query, Request, HTTPException
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from cachetools import TTLCache
 
 # ==========================================
-# 📋 הגדרת לוגר מקצועי וממוקד
+# 📋 הגדרת לוגר מקצועי
 # ==========================================
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +32,7 @@ app.add_middleware(
 )
 
 # ==========================================
-# 🔑 הגדרות אבטחה ומשתני סביבה
+# 🔑 הגדרות אבטחה, קש וחנות סשנים
 # ==========================================
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "b356e0c424msh95c209990ea7472p1fe240jsn2a029b5480bf")
 RAPIDAPI_HOST = "youtube-mp3-audio-video-downloader.p.rapidapi.com"
@@ -41,12 +41,15 @@ DB_PATH = "ivr_production.db"
 search_cache = TTLCache(maxsize=1000, ttl=900)
 stream_url_cache = TTLCache(maxsize=500, ttl=600)
 
+# 🔒 מילון נעילות גלובלי למניעת Race Conditions לפי מספר טלפון
+session_locks: Dict[str, asyncio.Lock] = {}
+
 # ==========================================
 # 🩺 נתיב הבריאות עבור Render
 # ==========================================
 @app.get("/")
 async def render_health_check():
-    return {"status": "healthy", "engine": "IVR Core 2026"}
+    return {"status": "healthy", "engine": "IVR Core 2026 Secured"}
 
 # ==========================================
 # 💾 בסיס נתונים קבוע (SQLite)
@@ -118,7 +121,7 @@ async def is_rate_limited(phone: str) -> bool:
     return False
 
 # ==========================================
-# 🔍 מנוע חיפושי InnerTube (משופר - ללא "2026")
+# 🔍 מנוע חיפושי InnerTube (משופר ללא סטרינג "2026")
 # ==========================================
 async def search_youtube_innertube(query: str, filter_newest: bool = False) -> List[dict]:
     if query in search_cache and not filter_newest:
@@ -138,7 +141,7 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         "query": query
     }
     
-    # ✨ תיקון קריטי: אם המשתמש ביקש שירים חדשים, נפעיל פילטר פנימי של יוטיוב למיון לפי תאריך העלאה (האחרון שעולה)
+    # מיון נייטיב רשמי של יוטיוב לפי תאריך העלאה (הכי חדש שעולה עכשיו)
     if filter_newest:
         payload["params"] = "EgQIARAB"
 
@@ -153,8 +156,6 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         for attempt in range(3):
             try:
                 response = await client.post(url, json=payload, headers=headers, timeout=4.0)
-                logger.info(f"YouTube InnerTube HTTP Status: {response.status_code}")
-                
                 if response.status_code == 200:
                     data = response.json()
                     tracks = []
@@ -240,7 +241,6 @@ async def proxy_mp3_stream(video_id: str):
             async with httpx.AsyncClient(timeout=stream_timeout) as client:
                 async with client.stream("GET", target_url, headers={"User-Agent": "Mozilla/5.0"}) as response:
                     if response.status_code not in [200, 206]:
-                        logger.error(f"Target streaming server responded with code {response.status_code}")
                         return
                     async_iterator = response.aiter_bytes(chunk_size=64 * 1024)
                     while True:
@@ -280,10 +280,7 @@ def get_final_play_command(video_id: str, request: Request) -> str:
     port_suffix = ":10000" if "localhost" in host else ""
     
     stream_url = f"{protocol}://{host}{port_suffix}/stream/{video_id}.mp3"
-    
-    # ✨ אופציה A: פקודת read מטוהרת לחלוטין שמזרימה את ה-URL ומאזינה למקשים (מקסימום ספרה אחת, מינימום 0 - למעבר אוטומטי, המתנה של 2 שניות)
-    cmd = f"read={stream_url}=ValName,no,1,0,2,digits,no"
-    return cmd
+    return f"read={stream_url}=ValName,no,1,0,2,digits,no"
 
 # ==========================================
 # 🗃️ מנקה סשנים רדומים
@@ -302,154 +299,172 @@ async def startup_event():
     asyncio.create_task(active_session_cleanup())
 
 # ==========================================
-# 🎛️ הליבה המרכזית: ניהול פרוטוקול ה-IVR
+# 🎛️ הליבה המרכזית: מניעת Race Condition באמצעות Lock
 # ==========================================
 @app.get("/youtube", response_class=PlainTextResponse)
 async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str = Query(None)):
     if hangup == "yes" or not ApiPhone:
         return "OK"
 
-    if await is_rate_limited(ApiPhone):
-        cmd = make_ivr_read_command("בוצעו יותר מדי פעולות בדקה אנא המתן מעט", "1", "1", 5, "digits")
-        logger.info("IVR RESPONSE SENT: %s", cmd)
-        return cmd
+    # 🔒 שלב 1: שליפה או יצירה של מנעול ייחודי למספר הטלפון הנוכחי
+    if ApiPhone not in session_locks:
+        session_locks[ApiPhone] = asyncio.Lock()
 
-    val_params = [v for k, v in request.query_params.multi_items() if k == "ValName"]
-    ValName = val_params[-1] if val_params else None
+    # 🔒 שלב 2: כניסה לתוך סביבה מוגנת ומסונכרנת. קריאות מקבילות ימתינו כאן בתור!
+    async with session_locks[ApiPhone]:
+        
+        if await is_rate_limited(ApiPhone):
+            cmd = make_ivr_read_command("בוצעו יותר מדי פעולות אנא המתן מעט", "1", "1", 5, "digits")
+            logger.info("IVR RESPONSE SENT: %s", cmd)
+            return cmd
 
-    user_data = await run_db_query("SELECT authorized FROM users WHERE phone = ?", (ApiPhone,))
-    is_whitelisted = user_data and user_data[0] == 1
-    
-    session_data = await run_db_query("SELECT state, playlist_json, current_index FROM sessions WHERE phone = ?", (ApiPhone,))
-    
-    if not session_data:
-        state = "MAIN_MENU" if is_whitelisted else "CHECK_AUTH"
-        playlist = []
-        index = 0
-        await run_db_query(
-            "INSERT INTO sessions (phone, state, playlist_json, current_index, last_active) VALUES (?, ?, ?, ?, ?)",
-            (ApiPhone, state, "[]", 0, datetime.utcnow().isoformat()), commit=True
-        )
-    else:
-        state, playlist_json, index = session_data
-        playlist = json.loads(playlist_json)
+        # 🧼 שלב 3: ניקוי, זיקוק ובידוד ה-ValName האמיתי והאחרון ביותר מהקריאה
+        val_params = [v for k, v in request.query_params.multi_items() if k == "ValName"]
+        raw_val = val_params[-1] if val_params else None
+        
+        ValName = None
+        if raw_val is not None:
+            # חיתוך וניקוי של שרשורים כפולים מסוג ValName=2&ValName=0
+            clean_val = str(raw_val).split("&")[0].strip()
+            if clean_val:
+                ValName = clean_val
 
-    await run_db_query("UPDATE sessions SET last_active = ? WHERE phone = ?", (datetime.utcnow().isoformat(), ApiPhone), commit=True)
+        logger.info(f"PROCESSING REQUEST - Phone: {ApiPhone} | Extracted ValName: {ValName}")
 
-    # --- אימות קוד גישה ---
-    if not is_whitelisted and state == "CHECK_AUTH":
-        if ValName == "1234":
-            await run_db_query("INSERT OR REPLACE INTO users (phone, authorized) VALUES (?, 1)", (ApiPhone,), commit=True)
-            state = "MAIN_MENU"
-            ValName = None
+        user_data = await run_db_query("SELECT authorized FROM users WHERE phone = ?", (ApiPhone,))
+        is_whitelisted = user_data and user_data[0] == 1
+        
+        session_data = await run_db_query("SELECT state, playlist_json, current_index FROM sessions WHERE phone = ?", (ApiPhone,))
+        
+        if not session_data:
+            state = "MAIN_MENU" if is_whitelisted else "CHECK_AUTH"
+            playlist = []
+            index = 0
+            await run_db_query(
+                "INSERT INTO sessions (phone, state, playlist_json, current_index, last_active) VALUES (?, ?, ?, ?, ?)",
+                (ApiPhone, state, "[]", 0, datetime.utcnow().isoformat()), commit=True
+            )
         else:
-            if ValName:
-                cmd = make_ivr_read_command("קוד שגוי אנא נסה שנית", "4", "4", 10, "digits")
-            else:
-                cmd = make_ivr_read_command("אנא הקש את קוד הגישה", "4", "4", 10, "digits")
-            logger.info("IVR RESPONSE SENT: %s", cmd)
-            return cmd
+            state, playlist_json, index = session_data
+            playlist = json.loads(playlist_json)
 
-    # --- ניהול מצבי הנגן והתפריטים ---
-    if state == "MAIN_MENU":
-        if ValName == "1":
-            await run_db_query("UPDATE sessions SET state = 'WAITING_FOR_SEARCH' WHERE phone = ?", (ApiPhone,), commit=True)
-            cmd = make_ivr_read_command("אנא אמרו את שם השיר המבוקש לאחר הצליל", "1", "50", 10, "voice")
-            logger.info("IVR RESPONSE SENT: %s", cmd)
-            return cmd
-        elif ValName == "2":
-            # ✨ עכשיו יחזיר את הלהיטים האחרונים שעלו באמת הודות למיון הנייטיב של יוטיוב!
-            tracks = await search_youtube_innertube("שירים חסידיים חדשים", filter_newest=True)
+        logger.info(f"CURRENT SESSION STATE BEFORE LOGIC - State: {state} | Playlist size: {len(playlist)}")
+
+        await run_db_query("UPDATE sessions SET last_active = ? WHERE phone = ?", (datetime.utcnow().isoformat(), ApiPhone), commit=True)
+
+        # --- אימות קוד גישה ---
+        if not is_whitelisted and state == "CHECK_AUTH":
+            if ValName == "1234":
+                await run_db_query("INSERT OR REPLACE INTO users (phone, authorized) VALUES (?, 1)", (ApiPhone,), commit=True)
+                state = "MAIN_MENU"
+                ValName = None
+            else:
+                if ValName:
+                    cmd = make_ivr_read_command("קוד שגוי אנא נסה שנית", "4", "4", 10, "digits")
+                else:
+                    cmd = make_ivr_read_command("אנא הקש את קוד הגישה", "4", "4", 10, "digits")
+                logger.info("IVR RESPONSE SENT: %s", cmd)
+                return cmd
+
+        # --- ניהול מצבי הנגן והתפריטים ---
+        if state == "MAIN_MENU":
+            if ValName == "1":
+                await run_db_query("UPDATE sessions SET state = 'WAITING_FOR_SEARCH' WHERE phone = ?", (ApiPhone,), commit=True)
+                cmd = make_ivr_read_command("אנא אמרו את שם השיר המבוקש לאחר הצליל", "1", "50", 10, "voice")
+                logger.info("IVR RESPONSE SENT: %s", cmd)
+                return cmd
+            elif ValName == "2":
+                logger.info("Triggering InnerTube search for new Hasidic songs...")
+                tracks = await search_youtube_innertube("שירים חסידיים חדשים", filter_newest=True)
+                
+                if not tracks:
+                    cmd = make_ivr_read_command("לא נמצאו שירים כרגע", "1", "1", 3, "digits")
+                    logger.info("IVR RESPONSE SENT: %s", cmd)
+                    return cmd
+                    
+                await run_db_query("UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?", (json.dumps(tracks), ApiPhone), commit=True)
+                cmd = get_final_play_command(tracks[0]["id"], request)
+                logger.info("IVR RESPONSE SENT: %s", cmd)
+                return cmd
+            elif ValName == "3":
+                favs = await run_db_query("SELECT video_id, title FROM favorites WHERE phone = ?", (ApiPhone,), fetchall=True)
+                if not favs:
+                    cmd = make_ivr_read_command("רשימת המועדפים שלך ריקה חוזר לתפריט", "1", "1", 4, "digits")
+                    logger.info("IVR RESPONSE SENT: %s", cmd)
+                    return cmd
+                tracks = [{"id": f[0], "title": f[1], "duration": "00:00", "author": ""} for f in favs]
+                await run_db_query("UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?", (json.dumps(tracks), ApiPhone), commit=True)
+                cmd = get_final_play_command(tracks[0]["id"], request)
+                logger.info("IVR RESPONSE SENT: %s", cmd)
+                return cmd
+            else:
+                cmd = make_ivr_read_command("לחיפוש קולי הקש 1 לשירים חדשים הקש 2 למועדפים הקש 3", "1", "1", 10, "digits")
+                logger.info("IVR RESPONSE SENT: %s", cmd)
+                return cmd
+
+        elif state == "WAITING_FOR_SEARCH":
+            if not ValName or ValName in ["1", "2", "*", "#"]:
+                cmd = make_ivr_read_command("לא קלטתי אנא אמרו את שם השיר בבירור", "1", "50", 10, "voice")
+                logger.info("IVR RESPONSE SENT: %s", cmd)
+                return cmd
+            
+            tracks = await search_youtube_innertube(ValName, filter_newest=False)
             
             if not tracks:
-                cmd = make_ivr_read_command("לא נמצאו שירים כרגע", "1", "1", 3, "digits")
+                await run_db_query("UPDATE sessions SET state = 'MAIN_MENU' WHERE phone = ?", (ApiPhone,), commit=True)
+                cmd = make_ivr_read_command("לא נמצאו תוצאות חוזר לתפריט", "1", "1", 4, "digits")
                 logger.info("IVR RESPONSE SENT: %s", cmd)
                 return cmd
-                
-            await run_db_query("UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?", (json.dumps(tracks), ApiPhone), commit=True)
+            
+            await run_db_query(
+                "UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?", 
+                (json.dumps(tracks), ApiPhone), commit=True
+            )
+            
             cmd = get_final_play_command(tracks[0]["id"], request)
             logger.info("IVR RESPONSE SENT: %s", cmd)
             return cmd
-        elif ValName == "3":
-            favs = await run_db_query("SELECT video_id, title FROM favorites WHERE phone = ?", (ApiPhone,), fetchall=True)
-            if not favs:
-                cmd = make_ivr_read_command("רשימת המועדפים שלך ריקה חוזר לתפריט", "1", "1", 4, "digits")
+
+        elif state == "PLAYING_TRACKS":
+            if not playlist:
+                await run_db_query("UPDATE sessions SET state = 'MAIN_MENU' WHERE phone = ?", (ApiPhone,), commit=True)
+                cmd = make_ivr_read_command("לא ניתן להשמיע קובץ זה כרגע חוזר לתפריט", "1", "1", 4, "digits")
                 logger.info("IVR RESPONSE SENT: %s", cmd)
                 return cmd
-            tracks = [{"id": f[0], "title": f[1], "duration": "00:00", "author": ""} for f in favs]
-            await run_db_query("UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?", (json.dumps(tracks), ApiPhone), commit=True)
-            cmd = get_final_play_command(tracks[0]["id"], request)
-            logger.info("IVR RESPONSE SENT: %s", cmd)
-            return cmd
-        else:
-            cmd = make_ivr_read_command("לחיפוש קולי הקש 1 לשירים חדשים הקש 2 למועדפים הקש 3", "1", "1", 10, "digits")
+
+            if ValName == "1" or ValName == "": 
+                index += 1
+            elif ValName == "2": 
+                index -= 1
+            elif ValName == "3": 
+                cmd = make_ivr_read_command("השמעה מושהית להמשך הקש 4 לחזרה לתפריט הקש 0", "1", "1", 20, "digits")
+                logger.info("IVR RESPONSE SENT: %s", cmd)
+                return cmd
+            elif ValName == "4": 
+                pass 
+            elif ValName == "5": 
+                import random
+                random.shuffle(playlist)
+                index = 0
+                await run_db_query("UPDATE sessions SET playlist_json = ? WHERE phone = ?", (json.dumps(playlist), ApiPhone), commit=True)
+            elif ValName == "6": 
+                curr_track = playlist[index % len(playlist)]
+                await run_db_query("INSERT OR IGNORE INTO favorites (phone, video_id, title) VALUES (?, ?, ?)", (ApiPhone, curr_track["id"], curr_track["title"]), commit=True)
+                cmd = make_ivr_read_command("השיר נוסף למועדפים שלך ממשיך בנגינה", "1", "1", 3, "digits")
+                logger.info("IVR RESPONSE SENT: %s", cmd)
+                return cmd
+            elif ValName == "0":
+                await run_db_query("UPDATE sessions SET state = 'MAIN_MENU' WHERE phone = ?", (ApiPhone,), commit=True)
+                cmd = make_ivr_read_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
+                logger.info("IVR RESPONSE SENT: %s", cmd)
+                return cmd
+
+            index = index % len(playlist)
+            await run_db_query("UPDATE sessions SET current_index = ? WHERE phone = ?", (index, ApiPhone), commit=True)
+            
+            target_track = playlist[index]
+            cmd = get_final_play_command(target_track["id"], request)
             logger.info("IVR RESPONSE SENT: %s", cmd)
             return cmd
 
-    elif state == "WAITING_FOR_SEARCH":
-        if not ValName or ValName in ["1", "2", "*", "#"]:
-            cmd = make_ivr_read_command("לא קלטתי אנא אמרו את שם השיר בבירור", "1", "50", 10, "voice")
-            logger.info("IVR RESPONSE SENT: %s", cmd)
-            return cmd
-        
-        tracks = await search_youtube_innertube(ValName, filter_newest=False)
-        
-        if not tracks:
-            await run_db_query("UPDATE sessions SET state = 'MAIN_MENU' WHERE phone = ?", (ApiPhone,), commit=True)
-            cmd = make_ivr_read_command("לא נמצאו תוצאות חוזר לתפריט", "1", "1", 4, "digits")
-            logger.info("IVR RESPONSE SENT: %s", cmd)
-            return cmd
-        
-        await run_db_query(
-            "UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?", 
-            (json.dumps(tracks), ApiPhone), commit=True
-        )
-        
-        cmd = get_final_play_command(tracks[0]["id"], request)
-        logger.info("IVR RESPONSE SENT: %s", cmd)
-        return cmd
-
-    elif state == "PLAYING_TRACKS":
-        if not playlist:
-            await run_db_query("UPDATE sessions SET state = 'MAIN_MENU' WHERE phone = ?", (ApiPhone,), commit=True)
-            cmd = make_ivr_read_command("לא ניתן להשמיע קובץ זה כרגע חוזר לתפריט", "1", "1", 4, "digits")
-            logger.info("IVR RESPONSE SENT: %s", cmd)
-            return cmd
-
-        # ניתוח מקשים בזמן הניגון (הודות לפקודת ה-read החלקה)
-        if ValName == "1" or ValName == "": 
-            index += 1
-        elif ValName == "2": 
-            index -= 1
-        elif ValName == "3": 
-            cmd = make_ivr_read_command("השמעה מושהית להמשך הקש 4 לחזרה לתפריט הקש 0", "1", "1", 20, "digits")
-            logger.info("IVR RESPONSE SENT: %s", cmd)
-            return cmd
-        elif ValName == "4": 
-            pass 
-        elif ValName == "5": 
-            import random
-            random.shuffle(playlist)
-            index = 0
-            await run_db_query("UPDATE sessions SET playlist_json = ? WHERE phone = ?", (json.dumps(playlist), ApiPhone), commit=True)
-        elif ValName == "6": 
-            curr_track = playlist[index % len(playlist)]
-            await run_db_query("INSERT OR IGNORE INTO favorites (phone, video_id, title) VALUES (?, ?, ?)", (ApiPhone, curr_track["id"], curr_track["title"]), commit=True)
-            cmd = make_ivr_read_command("השיר נוסף למועדפים שלך ממשיך בנגינה", "1", "1", 3, "digits")
-            logger.info("IVR RESPONSE SENT: %s", cmd)
-            return cmd
-        elif ValName == "0":
-            await run_db_query("UPDATE sessions SET state = 'MAIN_MENU' WHERE phone = ?", (ApiPhone,), commit=True)
-            cmd = make_ivr_read_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
-            logger.info("IVR RESPONSE SENT: %s", cmd)
-            return cmd
-
-        index = index % len(playlist)
-        await run_db_query("UPDATE sessions SET current_index = ? WHERE phone = ?", (index, ApiPhone), commit=True)
-        
-        target_track = playlist[index]
-        cmd = get_final_play_command(target_track["id"], request)
-        logger.info("IVR RESPONSE SENT: %s", cmd)
-        return cmd
-
-    return "hangup"
+        return "hangup"
