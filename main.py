@@ -152,46 +152,81 @@ async def is_rate_limited(phone: str) -> bool:
 # ==========================================
 # חיפוש
 # ==========================================
-def recursive_find_video_renderers(data) -> list:
-    renderers = []
-    if isinstance(data, dict):
-        if "videoRenderer" in data:
-            renderers.append(data["videoRenderer"])
-        for value in data.values():
-            renderers.extend(recursive_find_video_renderers(value))
-    elif isinstance(data, list):
-        for item in data:
-            renderers.extend(recursive_find_video_renderers(item))
-    return renderers
+def extract_tracks_from_innertube(data: dict) -> List[dict]:
+    tracks = []
+    
+    def recursive_extract(node):
+        if isinstance(node, dict):
+            # סוגים נפוצים של רנדררים
+            renderer = None
+            if "videoRenderer" in node:
+                renderer = node["videoRenderer"]
+            elif "compactVideoRenderer" in node:
+                renderer = node["compactVideoRenderer"]
+            elif "richItemRenderer" in node and "content" in node["richItemRenderer"]:
+                recursive_extract(node["richItemRenderer"]["content"])
+                return
+            elif "itemSectionRenderer" in node:
+                recursive_extract(node["itemSectionRenderer"].get("contents", []))
+                return
+
+            if renderer and renderer.get("videoId"):
+                video_id = renderer.get("videoId")
+                title_runs = renderer.get("title", {}).get("runs", [{}])
+                title = title_runs[0].get("text", "שיר ללא שם") if title_runs else renderer.get("title", {}).get("simpleText", "שיר ללא שם")
+                
+                tracks.append({
+                    "id": video_id,
+                    "title": title,
+                    "duration": renderer.get("lengthText", {}).get("simpleText", "00:00"),
+                    "author": renderer.get("longBylineText", {}).get("runs", [{}])[0].get("text", "אמן")
+                })
+                return  # אל תמשיך עמוק מדי אחרי שמצאנו
+
+            # המשך חיפוש רקורסיבי
+            for value in node.values():
+                recursive_extract(value)
+                
+        elif isinstance(node, list):
+            for item in node:
+                recursive_extract(item)
+
+    recursive_extract(data)
+    return tracks
 
 async def search_invidious_fallback(query: str) -> List[dict]:
-    logger.info(f"⚡ Invidious Fallback for: '{query}'")
     instances = [
-        "https://inv.tux.digital",
-        "https://invidious.nerdvpn.de",
+        "https://invidious.projectsegfau.lt",
         "https://vid.puffyan.us",
-        "https://invidious.projectsegfau.lt"
+        "https://invidious.nerdvpn.de",
+        "https://inv.tux.digital"
     ]
     async with httpx.AsyncClient() as client:
         for inst in instances:
             try:
                 url = f"{inst}/api/v1/search"
-                resp = await client.get(url, params={"q": query, "type": "video"}, timeout=5.0)
+                resp = await client.get(url, params={"q": query, "type": "video"}, timeout=6.0)
+                
                 if resp.status_code == 200:
-                    data = resp.json()
+                    try:
+                        data = resp.json()
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invidious {inst} returned non-JSON")
+                        continue
+                        
                     tracks = []
                     for item in data:
-                        if item.get("type") == "video" and item.get("videoId"):
+                        if isinstance(item, dict) and item.get("videoId"):
                             tracks.append({
                                 "id": item["videoId"],
                                 "title": item.get("title", "שיר ללא שם"),
                                 "duration": str(item.get("lengthSeconds", "00:00")),
-                                "author": item.get("author", "אמן לא ידוע")
+                                "author": item.get("author", "אמן")
                             })
-                            if len(tracks) >= 15:
+                            if len(tracks) >= 12:
                                 break
                     if tracks:
-                        logger.info(f"✅ Invidious success: {len(tracks)} tracks")
+                        logger.info(f"✅ Invidious success via {inst}: {len(tracks)} tracks")
                         return tracks
             except Exception as e:
                 logger.warning(f"Invidious {inst} failed: {e}")
@@ -204,55 +239,56 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
 
     url = "https://www.youtube.com/youtubei/v1/search"
     payload = {
-        "context": {"client": {"clientName": "WEB", "clientVersion": "2.20260301.00.00", "hl": "he", "gl": "IL"}},
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": "2.20260601.01.00",  # עדכן גרסה
+                "hl": "he",
+                "gl": "IL"
+            }
+        },
         "query": query
     }
     if filter_newest:
-        payload["params"] = "EgQIARAB"
+        payload["params"] = "EgQIARAB"  # Sort by upload date
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Content-Type": "application/json",
-        "Origin": "https://www.youtube.com"
+        "Origin": "https://www.youtube.com",
+        "Referer": "https://www.youtube.com/"
     }
 
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=payload, headers=headers, timeout=6.0)
+            resp = await client.post(url, json=payload, headers=headers, timeout=7.0)
+            
+            logger.info(f"InnerTube status: {resp.status_code} for query: {query}")
+            
             if resp.status_code == 200:
                 raw_data = resp.json()
-                video_nodes = recursive_find_video_renderers(raw_data)
-
-                tracks = []
-                for vr in video_nodes:
-                    video_id = vr.get("videoId")
-                    if not video_id:
-                        continue
-                    title_runs = vr.get("title", {}).get("runs", [{}])
-                    title = title_runs[0].get("text", "שיר ללא שם") if title_runs else "שיר ללא שם"
-                    tracks.append({
-                        "id": video_id,
-                        "title": title,
-                        "duration": vr.get("lengthText", {}).get("simpleText", "00:00"),
-                        "author": vr.get("longBylineText", {}).get("runs", [{}])[0].get("text", "אמן")
-                    })
-                    if len(tracks) >= 15:
-                        break
-
+                
+                tracks = extract_tracks_from_innertube(raw_data)
+                
                 if tracks:
+                    logger.info(f"✅ InnerTube parsed successfully: {len(tracks)} tracks")
                     if not filter_newest:
                         search_cache[query] = tracks
-                    return tracks
+                    return tracks[:15]
+                else:
+                    logger.warning("InnerTube returned 200 but no tracks parsed. Raw structure hint: %s", 
+                                 str(list(raw_data.keys())[:10]) if isinstance(raw_data, dict) else "not dict")
     except Exception as e:
-        logger.error(f"InnerTube failed: {e}")
+        logger.error(f"InnerTube request failed: {e}")
 
-    # Fallback
-    fallback = await search_invidious_fallback(query)
-    if fallback:
-        return fallback
+    # Fallback רק אם InnerTube נכשל לגמרי
+    logger.info("InnerTube parsing failed → trying Invidious fallback")
+    fallback_tracks = await search_invidious_fallback(query)
+    if fallback_tracks:
+        return fallback_tracks[:15]
 
-    logger.warning("All search methods failed - using emergency playlist")
-    return EMERGENCY_PLAYLIST[:]
+    logger.warning("All search backends failed → Emergency playlist")
+    return EMERGENCY_PLAYLIST
 
 # ==========================================
 # Streaming
