@@ -40,7 +40,13 @@ DB_PATH = "ivr_production.db"
 
 search_cache = TTLCache(maxsize=1000, ttl=900)
 stream_url_cache = TTLCache(maxsize=500, ttl=600)
-STREAM_SEMAPHORE = asyncio.Semaphore(25)
+
+# ==========================================
+# 🩺 נתיב הבריאות עבור Render (מונע ה-Restart)
+# ==========================================
+@app.get("/")
+async def render_health_check():
+    return {"status": "healthy", "engine": "IVR Core 2026", "uptime": "stable"}
 
 # ==========================================
 # 💾 בסיס נתונים קבוע (SQLite)
@@ -212,11 +218,13 @@ async def fetch_rapidapi_link(video_id: str, client: httpx.AsyncClient) -> Optio
     return None
 
 # ==========================================
-# 🎵 מזרים מדיה אסינכרוני (Streaming Proxy)
+# 🎵 מזרים מדיה אסינכרוני (Streaming Proxy) המשופר
 # ==========================================
 @app.get("/stream/{video_id}.mp3")
 async def proxy_mp3_stream(video_id: str):
-    logger.info(f"Incoming streaming request captured for Video ID: {video_id}")
+    # 🌟 הוספת הלוג שביקשת לאימות כניסה לסטרים
+    logger.info(f"STREAM STARTED - Capture for Video ID: {video_id}")
+    
     if video_id in stream_url_cache:
         target_url = stream_url_cache[video_id]
     else:
@@ -227,36 +235,35 @@ async def proxy_mp3_stream(video_id: str):
             stream_url_cache[video_id] = target_url
 
     async def chunk_generator():
-        async with STREAM_SEMAPHORE:
-            try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=30.0)) as client:
-                    async with client.stream("GET", target_url, headers={"User-Agent": "Mozilla/5.0"}) as response:
-                        if response.status_code not in [200, 206]:
-                            logger.error(f"Target streaming server responded with code {response.status_code}")
-                            return
-                        async_iterator = response.aiter_bytes(chunk_size=64 * 1024)
-                        while True:
-                            try:
-                                chunk = await asyncio.wait_for(async_iterator.__anext__(), timeout=10.0)
-                                yield chunk
-                            except StopAsyncIteration:
-                                break
-                            except asyncio.TimeoutError:
-                                logger.error("Stream read timeout reached.")
-                                break
-            except Exception as e:
-                logger.error(f"Streaming anomaly detected: {e}")
+        # 🌟 ביטול ה-Semaphore לבדיקת יציבות ומניעת תקיעות ב-Event Loop
+        try:
+            # 🌟 הגדרת הטיימאאוט המהודק והקשוח שביקשת כדי למנוע משימות תלויות
+            stream_timeout = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
+            async with httpx.AsyncClient(timeout=stream_timeout) as client:
+                async with client.stream("GET", target_url, headers={"User-Agent": "Mozilla/5.0"}) as response:
+                    if response.status_code not in [200, 206]:
+                        logger.error(f"Target streaming server responded with code {response.status_code}")
+                        return
+                    async_iterator = response.aiter_bytes(chunk_size=64 * 1024)
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(async_iterator.__anext__(), timeout=10.0)
+                            yield chunk
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            logger.error("Stream chunk read timeout reached.")
+                            break
+        except Exception as e:
+            logger.error(f"Streaming anomaly detected: {e}")
 
     return StreamingResponse(chunk_generator(), media_type="audio/mpeg")
 
 # ==========================================
-# 🧼 פונקציית ניקוי סינטקס ייעודית עבור ימות המשיח
+# 🧼 פונקציית ניקוי סינטקס ייעודית
 # ==========================================
 def clean_text_for_ivr(text: str) -> str:
-    """מנקה הרמטית את כל התווים המיוחדים שגורמים לקריסת הפארסר של ימות המשיח"""
-    # השארת אותיות בעברית ובאנגלית, מספרים ורווחים בלבד (מעיף לחלוטין את התו '|')
     cleaned = re.sub(r'[^a-zA-Z0-9\sא-ת]', ' ', text)
-    # צמצום רווחים כפולים
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned
 
@@ -277,12 +284,11 @@ def get_final_play_command(video_id: str, title: str, request: Request) -> str:
     stream_url = f"{protocol}://{host}{port_suffix}/stream/{video_id}.mp3"
     logger.info(f"Target Stream URL: {stream_url}")
     
-    # ניקוי הכותרת מהתו '|' ומהגבלת אורך להקראה מהירה וחלקלקה
     clean_title = clean_text_for_ivr(title)[:60]
     announcement = f"מנגן כעת את {clean_title} לשיר הבא הקש 1 לקודם 2 לעצירה 3 לתפריט 0"
     
-    # בניית הפקודה ללא תווים שבורים ובסיום נקי (בלי & מיותר בסוף)
-    cmd = f"id_list_message=t-{announcement}&read={stream_url}=ValName,no,1,0,1,digits,no"
+    # 🌟 תיקון ימות המשיח: החלפת read= הבעייתי ב-playfile= הרשמי לקבצים והזרמות מרחוק
+    cmd = f"id_list_message=t-{announcement}&playfile={stream_url}"
     return cmd
 
 # ==========================================
@@ -345,7 +351,7 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
                 return make_ivr_read_command("קוד שגוי, אנא נסה שנית", "4", "4", 10, "digits")
             return make_ivr_read_command("אנא הקש את קוד הגישה", "4", "4", 10, "digits")
 
-    # --- ניהול מצבי הנגן והתפריטים ---
+    # --- ניהנהל מצבי הנגן והתפריטים ---
     if state == "MAIN_MENU":
         if ValName == "1":
             await run_db_query("UPDATE sessions SET state = 'WAITING_FOR_SEARCH' WHERE phone = ?", (ApiPhone,), commit=True)
