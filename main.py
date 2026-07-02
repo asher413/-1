@@ -5,8 +5,9 @@ import httpx
 import asyncio
 import sqlite3
 import logging
+import random
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any
+from typing import Optional, List
 
 from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.responses import PlainTextResponse, StreamingResponse
@@ -14,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from cachetools import TTLCache
 
 # ==========================================
-# 📋 לוגר
+# לוגר + FastAPI
 # ==========================================
 logging.basicConfig(
     level=logging.INFO,
@@ -37,9 +38,8 @@ RAPIDAPI_HOST = "youtube-mp3-audio-video-downloader.p.rapidapi.com"
 DB_PATH = "ivr_production.db"
 
 search_cache = TTLCache(maxsize=1000, ttl=900)
-stream_url_cache = TTLCache(maxsize=500, ttl=600)
+stream_url_cache = TTLCache(maxsize=500, ttl=720)  # 12 דקות
 
-# פלייליסט חירום
 EMERGENCY_PLAYLIST = [
     {"id": "4NzIOLEeJZM", "title": "נחמן פילמר שמחה פורצת גבולות 15", "duration": "1:26:07", "author": "נחמן פילמר"},
     {"id": "WSMFtm3ZqcY", "title": "סט להיטים דתי חרדי קיץ פול ווליום", "duration": "1:26:18", "author": "פול ווליום"},
@@ -48,43 +48,20 @@ EMERGENCY_PLAYLIST = [
 ]
 
 # ==========================================
-# בסיס נתונים
+# DB + Rate Limit
 # ==========================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            phone TEXT PRIMARY KEY,
-            authorized INTEGER DEFAULT 0,
-            access_code TEXT DEFAULT '1234'
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            phone TEXT PRIMARY KEY,
-            state TEXT,
-            playlist_json TEXT,
-            current_index INTEGER DEFAULT 0,
-            last_active TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS favorites (
-            phone TEXT,
-            video_id TEXT,
-            title TEXT,
-            PRIMARY KEY(phone, video_id)
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS rate_limits (
-            phone TEXT,
-            timestamp TEXT
-        )
-    """)
-    default_whitelist = ["0534133753", "0534133754"]
-    for ph in default_whitelist:
+    for table in [
+        """CREATE TABLE IF NOT EXISTS users (phone TEXT PRIMARY KEY, authorized INTEGER DEFAULT 0, access_code TEXT DEFAULT '1234')""",
+        """CREATE TABLE IF NOT EXISTS sessions (phone TEXT PRIMARY KEY, state TEXT, playlist_json TEXT, current_index INTEGER DEFAULT 0, last_active TEXT)""",
+        """CREATE TABLE IF NOT EXISTS favorites (phone TEXT, video_id TEXT, title TEXT, PRIMARY KEY(phone, video_id))""",
+        """CREATE TABLE IF NOT EXISTS rate_limits (phone TEXT, timestamp TEXT)"""
+    ]:
+        cursor.execute(table)
+    
+    for ph in ["0534133753", "0534133754"]:
         cursor.execute("INSERT OR IGNORE INTO users (phone, authorized) VALUES (?, 1)", (ph,))
     conn.commit()
     conn.close()
@@ -93,301 +70,210 @@ init_db()
 
 async def run_db_query(query: str, params: tuple = (), fetchall: bool = False, commit: bool = False):
     def _execute():
+        conn = sqlite3.connect(DB_PATH, timeout=10)
         try:
-            conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             cursor.execute(query, params)
-            if fetchall:
-                result = cursor.fetchall()
-            else:
-                result = cursor.fetchone()
+            result = cursor.fetchall() if fetchall else cursor.fetchone()
             if commit:
                 conn.commit()
-            conn.close()
             return result
         except Exception as e:
-            logger.error(f"DB Error: {e} | Query: {query}")
-            if commit:
-                try:
-                    conn.rollback()
-                except:
-                    pass
+            logger.error(f"DB Error: {e} | Query: {query[:100]}")
+            if commit and conn:
+                conn.rollback()
             raise
+        finally:
+            conn.close()
+
     try:
-        return await asyncio.get_running_loop().run_in_executor(None, _execute)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _execute)
     except Exception as e:
         logger.error(f"run_db_query failed: {e}")
         return None if not fetchall else []
 
-# ==========================================
-# Rate Limiting
-# ==========================================
 async def is_rate_limited(phone: str) -> bool:
     if not phone or len(phone) < 9:
         return True
     try:
         now = datetime.utcnow()
-        one_minute_ago = (now - timedelta(minutes=1)).isoformat()
-        await run_db_query("DELETE FROM rate_limits WHERE timestamp < ?", (one_minute_ago,), commit=True)
+        one_min_ago = (now - timedelta(minutes=1)).isoformat()
+        await run_db_query("DELETE FROM rate_limits WHERE timestamp < ?", (one_min_ago,), commit=True)
         
-        count_row = await run_db_query(
+        count = await run_db_query(
             "SELECT COUNT(*) FROM rate_limits WHERE phone = ? AND timestamp > ?",
-            (phone, one_minute_ago)
+            (phone, one_min_ago)
         )
-        count = count_row[0] if count_row else 0
+        count = count[0] if count else 0
         
-        if count >= 20:
+        if count >= 25:
             return True
-        
-        await run_db_query(
-            "INSERT INTO rate_limits (phone, timestamp) VALUES (?, ?)",
-            (phone, now.isoformat()),
-            commit=True
-        )
+        await run_db_query("INSERT INTO rate_limits (phone, timestamp) VALUES (?, ?)", 
+                          (phone, now.isoformat()), commit=True)
         return False
-    except Exception as e:
-        logger.error(f"Rate limit check failed: {e}")
-        return True  # בטוח יותר לחסום
+    except:
+        return True
 
 # ==========================================
-# חיפוש
+# חיפוש משופר
 # ==========================================
 def extract_tracks_from_innertube(data: dict) -> List[dict]:
     tracks = []
-    
-    def recursive_extract(node):
+    def recursive(node):
         if isinstance(node, dict):
-            # סוגים נפוצים של רנדררים
-            renderer = None
-            if "videoRenderer" in node:
-                renderer = node["videoRenderer"]
-            elif "compactVideoRenderer" in node:
-                renderer = node["compactVideoRenderer"]
-            elif "richItemRenderer" in node and "content" in node["richItemRenderer"]:
-                recursive_extract(node["richItemRenderer"]["content"])
-                return
-            elif "itemSectionRenderer" in node:
-                recursive_extract(node["itemSectionRenderer"].get("contents", []))
-                return
-
-            if renderer and renderer.get("videoId"):
-                video_id = renderer.get("videoId")
-                title_runs = renderer.get("title", {}).get("runs", [{}])
-                title = title_runs[0].get("text", "שיר ללא שם") if title_runs else renderer.get("title", {}).get("simpleText", "שיר ללא שם")
-                
-                tracks.append({
-                    "id": video_id,
-                    "title": title,
-                    "duration": renderer.get("lengthText", {}).get("simpleText", "00:00"),
-                    "author": renderer.get("longBylineText", {}).get("runs", [{}])[0].get("text", "אמן")
-                })
-                return  # אל תמשיך עמוק מדי אחרי שמצאנו
-
-            # המשך חיפוש רקורסיבי
-            for value in node.values():
-                recursive_extract(value)
-                
+            for key in ["videoRenderer", "compactVideoRenderer"]:
+                if key in node:
+                    r = node[key]
+                    if r.get("videoId"):
+                        title_runs = r.get("title", {}).get("runs", [{}])
+                        title = title_runs[0].get("text") or r.get("title", {}).get("simpleText", "שיר ללא שם")
+                        tracks.append({
+                            "id": r["videoId"],
+                            "title": title,
+                            "duration": r.get("lengthText", {}).get("simpleText", "00:00"),
+                            "author": r.get("longBylineText", {}).get("runs", [{}])[0].get("text", "אמן")
+                        })
+                        return
+            for v in node.values():
+                recursive(v)
         elif isinstance(node, list):
             for item in node:
-                recursive_extract(item)
-
-    recursive_extract(data)
+                recursive(item)
+    recursive(data)
     return tracks
-
-async def search_invidious_fallback(query: str) -> List[dict]:
-    instances = [
-        "https://invidious.projectsegfau.lt",
-        "https://vid.puffyan.us",
-        "https://invidious.nerdvpn.de",
-        "https://inv.tux.digital"
-    ]
-    async with httpx.AsyncClient() as client:
-        for inst in instances:
-            try:
-                url = f"{inst}/api/v1/search"
-                resp = await client.get(url, params={"q": query, "type": "video"}, timeout=6.0)
-                
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                    except json.JSONDecodeError:
-                        logger.warning(f"Invidious {inst} returned non-JSON")
-                        continue
-                        
-                    tracks = []
-                    for item in data:
-                        if isinstance(item, dict) and item.get("videoId"):
-                            tracks.append({
-                                "id": item["videoId"],
-                                "title": item.get("title", "שיר ללא שם"),
-                                "duration": str(item.get("lengthSeconds", "00:00")),
-                                "author": item.get("author", "אמן")
-                            })
-                            if len(tracks) >= 12:
-                                break
-                    if tracks:
-                        logger.info(f"✅ Invidious success via {inst}: {len(tracks)} tracks")
-                        return tracks
-            except Exception as e:
-                logger.warning(f"Invidious {inst} failed: {e}")
-                continue
-    return []
 
 async def search_youtube_innertube(query: str, filter_newest: bool = False) -> List[dict]:
     if not filter_newest and query in search_cache:
         return search_cache[query]
 
-    url = "https://www.youtube.com/youtubei/v1/search"
-    payload = {
-        "context": {
-            "client": {
-                "clientName": "WEB",
-                "clientVersion": "2.20260601.01.00",  # עדכן גרסה
-                "hl": "he",
-                "gl": "IL"
-            }
-        },
-        "query": query
-    }
-    if filter_newest:
-        payload["params"] = "EgQIARAB"  # Sort by upload date
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Content-Type": "application/json",
-        "Origin": "https://www.youtube.com",
-        "Referer": "https://www.youtube.com/"
-    }
-
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=payload, headers=headers, timeout=7.0)
-            
-            logger.info(f"InnerTube status: {resp.status_code} for query: {query}")
-            
+            resp = await client.post(
+                "https://www.youtube.com/youtubei/v1/search",
+                json={
+                    "context": {"client": {"clientName": "WEB", "clientVersion": "2.20260601.01.00", "hl": "he", "gl": "IL"}},
+                    "query": query,
+                    "params": "EgQIARAB" if filter_newest else None
+                },
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Content-Type": "application/json",
+                    "Origin": "https://www.youtube.com"
+                },
+                timeout=7.0
+            )
             if resp.status_code == 200:
-                raw_data = resp.json()
-                
-                tracks = extract_tracks_from_innertube(raw_data)
-                
+                tracks = extract_tracks_from_innertube(resp.json())
                 if tracks:
-                    logger.info(f"✅ InnerTube parsed successfully: {len(tracks)} tracks")
                     if not filter_newest:
                         search_cache[query] = tracks
+                    logger.info(f"✅ InnerTube success: {len(tracks)} tracks")
                     return tracks[:15]
-                else:
-                    logger.warning("InnerTube returned 200 but no tracks parsed. Raw structure hint: %s", 
-                                 str(list(raw_data.keys())[:10]) if isinstance(raw_data, dict) else "not dict")
     except Exception as e:
-        logger.error(f"InnerTube request failed: {e}")
+        logger.error(f"InnerTube failed: {e}")
 
-    # Fallback רק אם InnerTube נכשל לגמרי
-    logger.info("InnerTube parsing failed → trying Invidious fallback")
-    fallback_tracks = await search_invidious_fallback(query)
-    if fallback_tracks:
-        return fallback_tracks[:15]
+    # Fallback
+    fallback = await search_invidious_fallback(query)
+    return fallback[:15] if fallback else EMERGENCY_PLAYLIST
 
-    logger.warning("All search backends failed → Emergency playlist")
-    return EMERGENCY_PLAYLIST
+async def search_invidious_fallback(query: str) -> List[dict]:
+    instances = ["https://invidious.projectsegfau.lt", "https://vid.puffyan.us", "https://invidious.nerdvpn.de"]
+    async with httpx.AsyncClient() as client:
+        for inst in instances:
+            try:
+                r = await client.get(f"{inst}/api/v1/search", params={"q": query, "type": "video"}, timeout=6.0)
+                if r.status_code == 200:
+                    data = r.json()
+                    tracks = [{
+                        "id": item["videoId"],
+                        "title": item.get("title", "שיר ללא שם"),
+                        "duration": str(item.get("lengthSeconds", "00:00")),
+                        "author": item.get("author", "אמן")
+                    } for item in data if item.get("videoId")][:15]
+                    if tracks:
+                        logger.info(f"✅ Invidious success via {inst}")
+                        return tracks
+            except Exception as e:
+                logger.warning(f"Invidious {inst} failed: {e}")
+    return []
 
 # ==========================================
-# Streaming
+# Streaming משופר
 # ==========================================
-async def fetch_stream_url(video_id: str) -> Optional[str]:
+async def get_stream_url(video_id: str) -> str:
     if video_id in stream_url_cache:
         return stream_url_cache[video_id]
 
     async with httpx.AsyncClient() as client:
-        # Cobalt
         for inst in ["https://api.cobalt.tools/api/json", "https://cobalt.api.v0.wtf/api/json"]:
             try:
-                r = await client.post(
-                    inst,
-                    json={"url": f"https://www.youtube.com/watch?v={video_id}", "downloadMode": "audio", "audioFormat": "mp3"},
-                    timeout=4.0
-                )
-                if r.status_code == 200:
-                    url = r.json().get("url")
-                    if url:
-                        stream_url_cache[video_id] = url
-                        return url
+                r = await client.post(inst, json={
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                    "downloadMode": "audio",
+                    "audioFormat": "mp3"
+                }, timeout=5.0)
+                if r.status_code == 200 and (url := r.json().get("url")):
+                    stream_url_cache[video_id] = url
+                    return url
             except:
                 continue
 
-        # RapidAPI fallback
-        try:
-            r = await client.get(
-                f"https://{RAPIDAPI_HOST}/get_mp3_download_link/{video_id}",
-                headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST},
-                timeout=5.0
-            )
-            if r.status_code == 200:
-                js = r.json()
-                url = js.get("file") or js.get("link") or js.get("url")
-                if url:
-                    stream_url_cache[video_id] = url
-                    return url
-        except:
-            pass
-
-    # Invidious last resort
-    fallback = f"https://invidious.projectsegfau.lt/latest_version?id={video_id}&itag=140"
-    stream_url_cache[video_id] = fallback
-    return fallback
+        # Fallbacks
+        url = f"https://invidious.projectsegfau.lt/latest_version?id={video_id}&itag=140"
+        stream_url_cache[video_id] = url
+        return url
 
 @app.get("/stream/{video_id}.mp3")
-async def proxy_mp3_stream(video_id: str):
+async def proxy_mp3_stream(video_id: str, request: Request):
     if not video_id or len(video_id) != 11:
-        raise HTTPException(400, "Invalid video ID")
+        raise HTTPException(400, "Invalid ID")
     
-    target_url = await fetch_stream_url(video_id)
+    if await is_rate_limited("stream_" + video_id[-6:]):  # הגנה בסיסית
+        raise HTTPException(429, "Too many requests")
 
-    async def chunk_generator():
+    target_url = await get_stream_url(video_id)
+
+    async def generator():
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(25.0)) as client:  # timeout ארוך יותר
                 async with client.stream("GET", target_url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
                     if resp.status_code != 200:
-                        logger.error(f"Stream failed with status {resp.status_code}")
+                        logger.error(f"Stream {video_id} failed with {resp.status_code}")
+                        yield b""  # שקט במקום קריסה
                         return
-                    async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                    async for chunk in resp.aiter_bytes(64 * 1024):
                         yield chunk
         except Exception as e:
-            logger.error(f"Streaming error for {video_id}: {e}")
+            logger.error(f"Streaming error {video_id}: {e}")
 
-    return StreamingResponse(chunk_generator(), media_type="audio/mpeg")
+    return StreamingResponse(generator(), media_type="audio/mpeg")
 
 # ==========================================
 # IVR Helpers
 # ==========================================
 def clean_text_for_ivr(text: str) -> str:
-    cleaned = re.sub(r'[^a-zA-Z0-9\sא-ת]', ' ', text or "")
-    return re.sub(r'\s+', ' ', cleaned).strip()[:200]
+    return re.sub(r'\s+', ' ', re.sub(r'[^a-zA-Z0-9\sא-ת]', ' ', text or "")).strip()[:180]
 
-def make_ivr_read_command(text: str, min_dig: str, max_dig: str, sec: int, mode: str) -> str:
+def make_ivr_read_command(text: str, min_dig="1", max_dig="1", sec=8, mode="digits") -> str:
     clean = clean_text_for_ivr(text)
-    if mode.lower() == "voice":
-        return f"read=t-{clean}=ValName,no,50,1,{sec},voice,no"
     return f"read=t-{clean}=ValName,no,{max_dig},{min_dig},{sec},{mode.lower()},no"
 
 def get_final_play_command(video_id: str, request: Request) -> str:
-    host = (request.headers.get("x-forwarded-host") or request.headers.get("host", "")).split(":")[0]
+    host = (request.headers.get("x-forwarded-host") or 
+            request.headers.get("host") or 
+            "localhost").split(":")[0]
     protocol = request.headers.get("x-forwarded-proto") or ("https" if "localhost" not in host else "http")
     port = ":10000" if "localhost" in host else ""
     return f"read={protocol}://{host}{port}/stream/{video_id}.mp3=ValName,no,1,0,2,digits,no"
 
 # ==========================================
-# Background cleanup
+# Background
 # ==========================================
 async def active_session_cleanup():
     while True:
-        try:
-            await run_db_query(
-                "DELETE FROM sessions WHERE last_active < ?",
-                ((datetime.utcnow() - timedelta(hours=4)).isoformat(),),
-                commit=True
-            )
-        except Exception as e:
-            logger.error(f"Cleanup failed: {e}")
+        await run_db_query("DELETE FROM sessions WHERE last_active < ?", 
+                          ((datetime.utcnow() - timedelta(hours=4)).isoformat(),), commit=True)
         await asyncio.sleep(1800)
 
 @app.on_event("startup")
@@ -395,140 +281,107 @@ async def startup_event():
     asyncio.create_task(active_session_cleanup())
 
 # ==========================================
-# Main IVR Endpoint
+# Main Endpoint
 # ==========================================
 @app.get("/youtube", response_class=PlainTextResponse)
 async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str = Query(None)):
     if hangup == "yes" or not ApiPhone:
         return "OK"
 
-    val_params = [v for k, v in request.query_params.multi_items() if k == "ValName"]
+    val_params = [v for k, v in request.query_params.multi_items() if k.lower() == "valname"]
     ValName = val_params[-1] if val_params else None
 
     logger.info(f"📞 Phone: {ApiPhone} | ValName: {ValName}")
 
     if await is_rate_limited(ApiPhone):
-        cmd = make_ivr_read_command("בוצעו יותר מדי פעולות אנא המתן מעט", "1", "1", 5, "digits")
-        return cmd
+        return make_ivr_read_command("יותר מדי פעולות, המתן מעט", "1", "1", 6)
 
-    # Load user & session
-    user_data = await run_db_query("SELECT authorized FROM users WHERE phone = ?", (ApiPhone,))
-    is_whitelisted = bool(user_data and user_data[0] == 1)
-
+    # Load session safely
     session_data = await run_db_query("SELECT state, playlist_json, current_index FROM sessions WHERE phone = ?", (ApiPhone,))
-    
-    if not session_data:
-        state = "MAIN_MENU" if is_whitelisted else "CHECK_AUTH"
-        await run_db_query(
-            "INSERT INTO sessions (phone, state, playlist_json, current_index, last_active) VALUES (?, ?, ?, ?, ?)",
-            (ApiPhone, state, "[]", 0, datetime.utcnow().isoformat()),
-            commit=True
-        )
-        playlist = []
-        index = 0
-    else:
+    if session_data:
         state, playlist_json, index = session_data
         playlist = json.loads(playlist_json) if playlist_json else []
         index = index or 0
+    else:
+        is_whitelisted = bool(await run_db_query("SELECT authorized FROM users WHERE phone = ?", (ApiPhone,)))
+        state = "MAIN_MENU" if is_whitelisted else "CHECK_AUTH"
+        playlist = []
+        index = 0
+        await run_db_query(
+            "INSERT INTO sessions (phone, state, playlist_json, current_index, last_active) VALUES (?, ?, ?, ?, ?)",
+            (ApiPhone, state, "[]", 0, datetime.utcnow().isoformat()), commit=True
+        )
 
     await run_db_query("UPDATE sessions SET last_active = ? WHERE phone = ?", 
                       (datetime.utcnow().isoformat(), ApiPhone), commit=True)
 
-    # Auth flow
-    if not is_whitelisted and state == "CHECK_AUTH":
+    # Auth
+    if state == "CHECK_AUTH":
         if ValName == "1234":
             await run_db_query("INSERT OR REPLACE INTO users (phone, authorized) VALUES (?, 1)", (ApiPhone,), commit=True)
             state = "MAIN_MENU"
-            ValName = None
         else:
-            msg = "קוד שגוי אנא נסה שנית" if ValName else "אנא הקש את קוד הגישה"
-            return make_ivr_read_command(msg, "4", "4", 10, "digits")
+            return make_ivr_read_command("קוד שגוי או הקש קוד" if ValName else "הקש קוד גישה", "4", "4", 10)
 
     # ==================== MAIN MENU ====================
     if state == "MAIN_MENU":
         if ValName == "1":
             await run_db_query("UPDATE sessions SET state = 'WAITING_FOR_SEARCH' WHERE phone = ?", (ApiPhone,), commit=True)
-            return make_ivr_read_command("אנא אמרו את שם השיר לאחר הצליל", "1", "50", 10, "voice")
-        
-        elif ValName == "2":
+            return make_ivr_read_command("אמרו את שם השיר אחרי הצליל", "1", "50", 12, "voice")
+        if ValName == "2":
             tracks = await search_youtube_innertube("שירים חסידיים חדשים", filter_newest=True)
-            if not tracks:
-                tracks = EMERGENCY_PLAYLIST
-            await run_db_query(
-                "UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?",
-                (json.dumps(tracks), ApiPhone), commit=True
-            )
-            return get_final_play_command(tracks[0]["id"], request)
-
-        elif ValName == "3":
+            await run_db_query("UPDATE sessions SET state='PLAYING_TRACKS', playlist_json=?, current_index=0 WHERE phone=?", 
+                              (json.dumps(tracks), ApiPhone), commit=True)
+            return get_final_play_command(tracks[0]["id"], request) if tracks else make_ivr_read_command("אין תוצאות", "1", "1", 5)
+        if ValName == "3":
             favs = await run_db_query("SELECT video_id, title FROM favorites WHERE phone = ?", (ApiPhone,), fetchall=True)
             if not favs:
-                return make_ivr_read_command("רשימת המועדפים ריקה", "1", "1", 4, "digits")
+                return make_ivr_read_command("אין מועדפים", "1", "1", 5)
             tracks = [{"id": f[0], "title": f[1], "duration": "00:00", "author": ""} for f in favs]
-            await run_db_query(
-                "UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?",
-                (json.dumps(tracks), ApiPhone), commit=True
-            )
+            await run_db_query("UPDATE sessions SET state='PLAYING_TRACKS', playlist_json=?, current_index=0 WHERE phone=?", 
+                              (json.dumps(tracks), ApiPhone), commit=True)
             return get_final_play_command(tracks[0]["id"], request)
-
-        else:
-            return make_ivr_read_command("לחיפוש קולי 1 • שירים חדשים 2 • מועדפים 3", "1", "1", 10, "digits")
+        return make_ivr_read_command("1=חיפוש 2=חדשים 3=מועדפים", "1", "1", 10)
 
     # ==================== SEARCH ====================
-    elif state == "WAITING_FOR_SEARCH":
-        if not ValName or len(ValName.strip()) < 2 or ValName in ["1", "2", "*", "#"]:
-            return make_ivr_read_command("לא קלטתי בבירור, אנא אמרו שוב", "1", "50", 10, "voice")
-
+    if state == "WAITING_FOR_SEARCH":
+        if not ValName or len(ValName.strip()) < 2:
+            return make_ivr_read_command("לא הבנתי, אמרו שוב", "1", "50", 10, "voice")
         tracks = await search_youtube_innertube(ValName.strip())
-        if not tracks:
-            tracks = EMERGENCY_PLAYLIST
+        await run_db_query("UPDATE sessions SET state='PLAYING_TRACKS', playlist_json=?, current_index=0 WHERE phone=?", 
+                          (json.dumps(tracks), ApiPhone), commit=True)
+        return get_final_play_command(tracks[0]["id"], request) if tracks else make_ivr_read_command("אין תוצאות", "1", "1", 5)
 
-        await run_db_query(
-            "UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?",
-            (json.dumps(tracks), ApiPhone), commit=True
-        )
-        return get_final_play_command(tracks[0]["id"], request)
-
-    # ==================== PLAYING ====================
-    elif state == "PLAYING_TRACKS":
+    # ==================== PLAYING_TRACKS ====================
+    if state == "PLAYING_TRACKS":
         if not playlist:
             playlist = EMERGENCY_PLAYLIST
-            await run_db_query("UPDATE sessions SET playlist_json = ? WHERE phone = ?", 
-                             (json.dumps(playlist), ApiPhone), commit=True)
+            await run_db_query("UPDATE sessions SET playlist_json=? WHERE phone=?", (json.dumps(playlist), ApiPhone), commit=True)
 
         total = len(playlist)
         index = max(0, index % total) if total > 0 else 0
 
-        if ValName == "1" or ValName == "":
+        if ValName == "1":
             index = (index + 1) % total
         elif ValName == "2":
             index = (index - 1) % total
         elif ValName == "3":
-            return make_ivr_read_command("הושהה • להמשך 4 • תפריט 0", "1", "1", 20, "digits")
+            return make_ivr_read_command("מושהה • 4=המשך • 0=תפריט", "1", "1", 20)
         elif ValName == "5":
-            import random
             random.shuffle(playlist)
             index = 0
-            await run_db_query("UPDATE sessions SET playlist_json = ? WHERE phone = ?", 
-                             (json.dumps(playlist), ApiPhone), commit=True)
+            await run_db_query("UPDATE sessions SET playlist_json=? WHERE phone=?", (json.dumps(playlist), ApiPhone), commit=True)
         elif ValName == "6":
             curr = playlist[index]
-            await run_db_query(
-                "INSERT OR IGNORE INTO favorites (phone, video_id, title) VALUES (?, ?, ?)",
-                (ApiPhone, curr["id"], curr["title"]), commit=True
-            )
-            return make_ivr_read_command("נוסף למועדפים • ממשיך...", "1", "1", 3, "digits")
+            await run_db_query("INSERT OR IGNORE INTO favorites VALUES (?,?,?)", 
+                              (ApiPhone, curr["id"], curr["title"]), commit=True)
+            return make_ivr_read_command("נוסף למועדפים", "1", "1", 3)
         elif ValName == "0":
-            await run_db_query(
-                "UPDATE sessions SET state = 'MAIN_MENU', playlist_json = '[]', current_index = 0 WHERE phone = ?",
-                (ApiPhone,), commit=True
-            )
-            return make_ivr_read_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
+            await run_db_query("UPDATE sessions SET state='MAIN_MENU', playlist_json='[]', current_index=0 WHERE phone=?", (ApiPhone,), commit=True)
+            return make_ivr_read_command("חוזר לתפריט", "1", "1", 4)
 
-        # Update DB
-        await run_db_query("UPDATE sessions SET current_index = ? WHERE phone = ?", 
-                         (index, ApiPhone), commit=True)
-        
+        # Save index
+        await run_db_query("UPDATE sessions SET current_index=? WHERE phone=?", (index, ApiPhone), commit=True)
         return get_final_play_command(playlist[index]["id"], request)
 
     return "hangup"
