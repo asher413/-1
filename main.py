@@ -18,7 +18,7 @@ app.add_middleware(
 )
 
 # ====================================================================
-# 🔑 מפתח ה-API וההגדרות המעודכנות מהתמונה שלך:
+# 🔑 מפתח ה-API וההגדרות המעודכנות שלך:
 # ====================================================================
 RAPIDAPI_KEY = "b356e0c424msh95c209990ea7472p1fe240jsn2a029b5480bf"
 RAPIDAPI_HOST = "youtube-mp3-audio-video-downloader.p.rapidapi.com"
@@ -63,13 +63,81 @@ def fetch_youtube_ids(query: str, max_results=30, filter_newest=False):
             
     return ["YmK2mZf_uRE", "7un666Y6N_Q", "H762G1UoP2k", "4X7bLks7Oxc"][:max_results]
 
+def get_y2mate_audio_url(video_id: str) -> str:
+    """שולף קישור שמע ישיר ומיידי משרתי Y2Mate ללא שום המתנה - המנוע המהיר בעולם"""
+    try:
+        # שלב 1: אנליזה של הוידאו לקבלת מפתח ההמרה
+        analyze_url = "https://www.y2mate.com/mates/enMatesAM/analyze/ajax"
+        params = {
+            "k_query": f"https://www.youtube.com/watch?v={video_id}",
+            "k_page": "home",
+            "hl": "en",
+            "q_auto": "0"
+        }
+        data = urllib.parse.urlencode(params).encode('utf-8')
+        
+        req = urllib.request.Request(
+            analyze_url, data=data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=4) as response:
+            res = json.loads(response.read().decode('utf-8'))
+            if res.get("status") != "success":
+                return None
+            
+            # חילוץ המפתח להמרת MP3 128kbps
+            try:
+                k_key = res["links"]["mp3"]["mp3128"]["k"]
+            except KeyError:
+                mp3_dict = res.get("links", {}).get("mp3", {})
+                if mp3_dict:
+                    k_key = list(mp3_dict.values())[0]["k"]
+                else:
+                    return None
+
+        # שלב 2: בקשת הקישור הישיר באמצעות המפתח שחילצנו
+        convert_url = "https://www.y2mate.com/mates/enMatesAM/convert/index"
+        convert_params = {
+            "type": "youtube",
+            "_id": k_key,
+            "v_id": video_id,
+            "ajax": "1",
+            "ftype": "mp3",
+            "fquality": "128"
+        }
+        convert_data = urllib.parse.urlencode(convert_params).encode('utf-8')
+        
+        req2 = urllib.request.Request(
+            convert_url, data=convert_data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            }
+        )
+        with urllib.request.urlopen(req2, timeout=4) as response2:
+            res2 = json.loads(response2.read().decode('utf-8'))
+            if res2.get("status") == "success":
+                html_result = res2.get("result", "")
+                match = re.search(r'href=["\']([^"\']+)["\']', html_result)
+                if match:
+                    direct_url = match.group(1)
+                    print(f"🚀 Y2Mate Engine Success! Got instant streaming link.")
+                    return direct_url
+    except Exception as e:
+        print(f"Y2Mate Engine try failed: {e}")
+    return None
+
 def get_cobalt_audio_url(video_id: str) -> str:
-    """מנוע גיבוי המשתמש ב-Cobalt API הציבורי בפורמט מעודכן"""
+    """מנוע גיבוי שני המשתמש ב-Cobalt API הציבורי בפורמט מעודכן ותקין"""
     try:
         url = "https://api.cobalt.tools/api/json"
         payload = json.dumps({
             "url": f"https://www.youtube.com/watch?v={video_id}",
-            "audioOnly": True
+            "downloadMode": "audio",
+            "audioFormat": "mp3"
         }).encode('utf-8')
         
         req = urllib.request.Request(
@@ -82,24 +150,21 @@ def get_cobalt_audio_url(video_id: str) -> str:
             },
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, timeout=4) as response:
             res_data = json.loads(response.read().decode('utf-8'))
             if "url" in res_data:
-                print(f"🚀 Cobalt Backup Success!")
+                print(f"🚀 Cobalt Backup Engine Success!")
                 return res_data["url"]
     except Exception as e:
         print(f"Cobalt Backup failed: {e}")
     return None
 
 def get_rapidapi_mp3_url(video_id: str) -> str:
-    """פונה ל-RapidAPI ומחלצת את הקישור מתוך מפתח 'file' שנמצא בלוגים"""
-    # שמנו את m4a ראשון כי הוא מוכן מיידית בשרת שלהם ללא המתנה!
+    """בודק את RapidAPI. אם הקובץ דורש זמן עיבוד והמתנה - עובר מיידית למנועי ההזרמה המהירים"""
     endpoints = [
         f"https://{RAPIDAPI_HOST}/get_m4a_download_link/{video_id}",
         f"https://{RAPIDAPI_HOST}/get_mp3_download_link/{video_id}"
     ]
-    
-    backup_link = None
     
     for api_url in endpoints:
         endpoint_name = api_url.split('/')[-2]
@@ -109,11 +174,17 @@ def get_rapidapi_mp3_url(video_id: str) -> str:
             req.add_header("x-rapidapi-host", RAPIDAPI_HOST)
             req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=4) as response:
                 res_body = response.read().decode('utf-8')
                 res_data = json.loads(res_body)
                 
-                # חילוץ המפתח המדויק 'file' או 'reserved_file' מהלוגים שלך
+                comment = res_data.get("comment", "")
+                
+                # אם השרת מחזיר הודעה שהקובץ בעיבוד וייקח זמן - נדלג מייד כדי לא לחסום את המשתמש בטלפון
+                if "soon be ready" in comment or "processing" in comment.lower():
+                    print(f"⚠️ RapidAPI {endpoint_name} is in queue/processing mode. Bypassing wait time...")
+                    continue
+                
                 mp3_link = (
                     res_data.get("file") or 
                     res_data.get("reserved_file") or
@@ -121,29 +192,23 @@ def get_rapidapi_mp3_url(video_id: str) -> str:
                     res_data.get("url")
                 )
                 
-                comment = res_data.get("comment", "")
-                
-                # אם הקובץ עדיין דורש זמן עיבוד (מצב של 20-300 שניות ב-MP3)
-                if "soon be ready" in comment:
-                    print(f"⚠️ {endpoint_name} is not ready yet (needs conversion time). Checking alternative...")
-                    if mp3_link:
-                        backup_link = mp3_link  # נשמור בצד ליתר ביטחון
-                    continue
-                
                 if mp3_link:
-                    print(f"✅ Success! Got active link from {endpoint_name}: {mp3_link[:50]}...")
+                    print(f"✅ Success! Got instant cached link from RapidAPI {endpoint_name}!")
                     return mp3_link
                     
         except Exception as e:
-            print(f"Endpoint failed ({endpoint_name}): {e}")
+            print(f"RapidAPI {endpoint_name} connection failed or timeout: {e}")
             continue
             
-    if backup_link:
-        print("⚠️ Using the non-ready backup link since no immediate file was found.")
-        return backup_link
+    # --- מנועי הזרמה מהירים וללא המתנה במידה וה-RapidAPI איטי/לא מוכן ---
+    print("⚡ RapidAPI is unready or in queue. Activating High-Speed Instant Engines...")
+    
+    # מנוע 1: Y2Mate (הכי יציב ומהיר)
+    y2mate_url = get_y2mate_audio_url(video_id)
+    if y2mate_url:
+        return y2mate_url
         
-    # מעבר למערכת הגיבוי אם הכל נכשל
-    print("⚠️ RapidAPI failed. Trying Cobalt engine...")
+    # מנוע 2: Cobalt (גיבוי נוסף)
     cobalt_url = get_cobalt_audio_url(video_id)
     if cobalt_url:
         return cobalt_url
