@@ -4,7 +4,7 @@ import re
 import urllib.request
 import urllib.parse
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
@@ -63,117 +63,63 @@ def fetch_youtube_ids(query: str, max_results=30, filter_newest=False):
             
     return ["YmK2mZf_uRE", "7un666Y6N_Q", "H762G1UoP2k", "4X7bLks7Oxc"][:max_results]
 
-def get_invidious_stream_url(video_id: str) -> str:
-    """מוציא את ערוץ השמע המקורי של יוטיוב משרתי פרוקסי פתוחים - 0 שניות המתנה, עובד תמיד מיידית!"""
+
+@app.get("/stream/{video_id}.m4a")
+def proxy_audio_stream(video_id: str):
+    """מנוע הזרקה אסינכרוני - מזרים את השמע ישירות לטלפון של ימות המשיח וחוסך חסימות והפניות"""
+    # רשימת שרתי הזרמה מסודרת לפי השרת שעבד הכי טוב בלוג שלך!
     instances = [
+        "invidious.projectsegfau.lt",
         "yewtu.be",
-        "inv.tux.digital",
-        "invidious.nerdvpn.de",
-        "invidious.projectsegfau.lt"
+        "invidious.privacydev.net",
+        "inv.tux.digital"
     ]
+    
+    stream_url = None
     for instance in instances:
-        stream_url = f"https://{instance}/latest_version?id={video_id}&itag=140"
+        test_url = f"https://{instance}/latest_version?id={video_id}&itag=140"
         try:
-            req = urllib.request.Request(stream_url, method="HEAD")
+            req = urllib.request.Request(test_url, method="HEAD")
             with urllib.request.urlopen(req, timeout=2) as res:
                 if res.status in [200, 301, 302]:
-                    print(f"🚀 Invidious Direct Audio Stream Success via {instance}!")
-                    return stream_url
-        except Exception as e:
-            print(f"Invidious instance {instance} bypassed: {e}")
-            continue
-    return None
-
-def get_cobalt_audio_url(video_id: str) -> str:
-    """מנוע גיבוי Cobalt מעודכן לגרסה החדשה ביותר, סורק 3 שרתים שונים במקביל"""
-    instances = [
-        "https://api.cobalt.tools/api/json",
-        "https://cobalt.api.v0.wtf/api/json",
-        "https://cobalt.moe/api/json"
-    ]
-    
-    payload_options = [
-        {"url": f"https://www.youtube.com/watch?v={video_id}", "audioFormat": "mp3", "downloadMode": "audio"},
-        {"url": f"https://www.youtube.com/watch?v={video_id}", "audioOnly": True}
-    ]
-    
-    for instance in instances:
-        for payload in payload_options:
-            try:
-                encoded_payload = json.dumps(payload).encode('utf-8')
-                req = urllib.request.Request(
-                    instance,
-                    data=encoded_payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Accept": "application/json",
-                        "User-Agent": "Mozilla/5.0"
-                    },
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=3) as response:
-                    res_data = json.loads(response.read().decode('utf-8'))
-                    if "url" in res_data:
-                        print(f"🚀 Cobalt Engine Success via {instance}!")
-                        return res_data["url"]
-            except Exception:
-                continue
-    return None
-
-def get_rapidapi_mp3_url(video_id: str) -> str:
-    """בודק את ה-RapidAPI שלך. אם הוא מוכן - מחזיר אותו. אם הוא צריך זמן המרה - עובר מייד למנוע הזרמה מהיר ללא המתנה"""
-    endpoints = [
-        f"https://{RAPIDAPI_HOST}/get_m4a_download_link/{video_id}",
-        f"https://{RAPIDAPI_HOST}/get_mp3_download_link/{video_id}"
-    ]
-    
-    for api_url in endpoints:
-        endpoint_name = api_url.split('/')[-2]
-        try:
-            req = urllib.request.Request(api_url)
-            req.add_header("x-rapidapi-key", RAPIDAPI_KEY)
-            req.add_header("x-rapidapi-host", RAPIDAPI_HOST)
-            req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-            
-            with urllib.request.urlopen(req, timeout=3) as response:
-                res_body = response.read().decode('utf-8')
-                res_data = json.loads(res_body)
-                
-                comment = res_data.get("comment", "")
-                if "soon be ready" in comment or "processing" in comment.lower():
-                    print(f"⚠️ RapidAPI {endpoint_name} requires conversion time. Activating High-Speed Fallbacks...")
-                    continue
-                
-                mp3_link = (
-                    res_data.get("file") or 
-                    res_data.get("reserved_file") or
-                    res_data.get("link") or 
-                    res_data.get("url")
-                )
-                
-                if mp3_link:
-                    print(f"✅ Instant Cache Hit from RapidAPI {endpoint_name}!")
-                    return mp3_link
-                    
-        except Exception as e:
-            print(f"RapidAPI {endpoint_name} check timed out or failed: {e}")
+                    stream_url = test_url
+                    print(f"🌟 Proxy successfully locked on instance: {instance}")
+                    break
+        except Exception:
             continue
             
-    # --- מנועי ההזרקה המהירים והמיידיים ללא שום תור והמתנה ---
-    print("⚡ Activating High-Speed Instant Engines...")
-    
-    # מנוע 1: הזרמת שמע ישירה משרתי יוטיוב (0 שניות המתנה!)
-    invidious_url = get_invidious_stream_url(video_id)
-    if invidious_url:
-        return invidious_url
+    if not stream_url:
+        print("⚠️ All invidious instances busy. Using emergency backup track.")
+        stream_url = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
         
-    # מנוע 2: קובלט בגרסה החדשה
-    cobalt_url = get_cobalt_audio_url(video_id)
-    if cobalt_url:
-        return cobalt_url
+    def stream_generator():
+        try:
+            req = urllib.request.Request(
+                stream_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as response:
+                while True:
+                    chunk = response.read(32 * 1024)  # חתיכות של 32 קילובייט להזרמה חלקה
+                    if not chunk:
+                        break
+                    yield chunk
+        except Exception as e:
+            print(f"Streaming pipe interrupted: {e}")
+            return
 
-    print("❌ All engines failed. Using emergency track.")
-    return "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
+    # החזרת תגובת הזרמה ישירה בפורמט שמע שימות המשיח אוהבת
+    return StreamingResponse(stream_generator(), media_type="audio/mp4")
+
+
+def get_fast_play_url(video_id: str, request: Request) -> str:
+    """מייצר קישור ישיר לשרת ה-Proxy שלנו בתוך פחות ממילישנייה אחת"""
+    base_url = str(request.base_url).rstrip('/')
+    # תיקון פרוטוקול עבור שרתי Render שמשתמשים ב-HTTPS חיצוני
+    if "localhost" not in base_url and "127.0.0.1" not in base_url:
+        base_url = base_url.replace("http://", "https://")
+    return f"{base_url}/stream/{video_id}.m4a"
+
 
 def make_native_tts_command(text: str, min_dig: str, max_dig: str, sec: int, type_mode: str) -> str:
     clean_text = text.replace("=", "").replace(",", "").replace("-", "")
@@ -181,6 +127,7 @@ def make_native_tts_command(text: str, min_dig: str, max_dig: str, sec: int, typ
         return f"read=t-{clean_text}=ValName,no,50,1,{sec},voice,no"
     confirm_hash = "yes" if (max_dig and int(max_dig) > 1) else "no"
     return f"read=t-{clean_text}=ValName,no,{max_dig},{min_dig},{sec},{type_mode.lower()},{confirm_hash}"
+
 
 @app.get("/youtube", response_class=PlainTextResponse)
 def handle_ivr(
@@ -235,7 +182,7 @@ def handle_ivr(
             session["index"] = 0
             if session["playlist"]:
                 video_id = session["playlist"][0]
-                direct_link = get_rapidapi_mp3_url(video_id)
+                direct_link = get_fast_play_url(video_id, request)
                 return f"play_url={direct_link}"
             return make_native_tts_command("לא נמצאו שירים חוזר לתפריט הראשי", "1", "1", 3, "digits")
             
@@ -259,7 +206,7 @@ def handle_ivr(
         session["index"] = 0
         if session["playlist"]:
             video_id = session["playlist"][0]
-            direct_link = get_rapidapi_mp3_url(video_id)
+            direct_link = get_fast_play_url(video_id, request)
             return f"play_url={direct_link}"
         else:
             session["state"] = "MAIN_MENU"
@@ -306,10 +253,10 @@ def handle_ivr(
                 session["index"] = chosen_number - 1
                 session["state"] = "PLAYING_LATEST" 
                 video_id = playlist[session["index"]]
-                direct_link = get_rapidapi_mp3_url(video_id)
+                direct_link = get_fast_play_url(video_id, request)
                 return f"play_url={direct_link}"
             else:
-                return make_native_tts_command(f"מספר מחוץ לתווח. נא הקש מספר בין 1 ל-{len(playlist)}", "1", "2", 10, "digits")
+                return make_native_tts_command(f"מספר מחוץ לטווח. נא הקש מספר בין 1 ל-{len(playlist)}", "1", "2", 10, "digits")
         except ValueError:
             return make_native_tts_command("קלט לא תקין. אנא הקש מספר שיר תקין", "1", "2", 10, "digits")
 
@@ -336,7 +283,7 @@ def handle_ivr(
         session["index"] = idx
         if playlist:
             video_id = playlist[idx]
-            direct_link = get_rapidapi_mp3_url(video_id)
+            direct_link = get_fast_play_url(video_id, request)
             return f"play_url={direct_link}"
         return make_native_tts_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
 
