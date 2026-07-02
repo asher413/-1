@@ -7,13 +7,13 @@ import sqlite3
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
-from fastapi import FastAPI, Query, Request, HTTPException
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from cachetools import TTLCache
 
 # ==========================================
-# 📋 הגדרת לוגר מקצועי וממוקד
+# 📋 הגדרת לוגר ייצור ממוקד
 # ==========================================
 logging.basicConfig(
     level=logging.INFO,
@@ -46,7 +46,7 @@ stream_url_cache = TTLCache(maxsize=500, ttl=600)
 # ==========================================
 @app.get("/")
 async def render_health_check():
-    return {"status": "healthy", "engine": "IVR Core 2026"}
+    return {"status": "healthy", "engine": "IVR Recursive Core 2026"}
 
 # ==========================================
 # 💾 בסיס נתונים קבוע (SQLite)
@@ -118,7 +118,23 @@ async def is_rate_limited(phone: str) -> bool:
     return False
 
 # ==========================================
-# 🔍 מנוע חיפושי InnerTube עם פארסר אדפטיבי חסין קריסה
+# 🎯 הפארסר האדפטיבי הרקורסיבי (התיקון הקריטי)
+# ==========================================
+def recursive_find_video_renderers(data) -> list:
+    """סורק את כל עץ ה-JSON באופן דינמי ומוצא את כל מפתחות videoRenderer ללא תלות במבנה האב"""
+    renderers = []
+    if isinstance(data, dict):
+        if "videoRenderer" in data:
+            renderers.append(data["videoRenderer"])
+        for value in data.values():
+            renderers.extend(recursive_find_video_renderers(value))
+    elif isinstance(data, list):
+        for item in data:
+            renderers.extend(recursive_find_video_renderers(item))
+    return renderers
+
+# ==========================================
+# 🔍 מנוע החיפוש הדינמי החדש של InnerTube
 # ==========================================
 async def search_youtube_innertube(query: str, filter_newest: bool = False) -> List[dict]:
     if query in search_cache and not filter_newest:
@@ -130,7 +146,7 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         "context": {
             "client": {
                 "clientName": "WEB",
-                "clientVersion": "2.20240228.00.00",
+                "clientVersion": "2.20260101.00.00",
                 "hl": "he",
                 "gl": "IL"
             }
@@ -138,8 +154,9 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         "query": query
     }
     
+    # מיון לפי סרטונים אחרונים שעלו (Native Flow ללא הדבקת "2026" ידנית בטקסט)
     if filter_newest:
-        payload["params"] = "EgQIARAB" # פילטר חומרה רשמי של יוטיוב לסינון לפי תאריך העלאה
+        payload["params"] = "EgQIARAB"
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -148,37 +165,33 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         "Referer": "https://www.youtube.com/"
     }
     
-    # ✨ פונקציית חילוץ רקורסיבית מובנית למניעת שברים בגלל שינויי מבנה ו-A/B Testing
-    def extract_video_renderers(obj):
-        if isinstance(obj, dict):
-            if "videoRenderer" in obj:
-                yield obj["videoRenderer"]
-            for v in obj.values():
-                yield from extract_video_renderers(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                yield from extract_video_renderers(item)
-
     async with httpx.AsyncClient() as client:
         for attempt in range(3):
             try:
-                response = await client.post(url, json=payload, headers=headers, timeout=4.0)
+                response = await client.post(url, json=payload, headers=headers, timeout=5.0)
                 logger.info(f"YouTube InnerTube HTTP Status: {response.status_code} (Attempt {attempt+1})")
                 
                 if response.status_code == 200:
-                    data = response.json()
-                    tracks = []
-                    seen_ids = set()
+                    raw_data = response.json()
                     
-                    # הרצה של הפארסר האדפטיבי על כל ה-JSON שחזר
-                    for vr in extract_video_renderers(data):
+                    # הפעלת הסורק האדפטיבי הרקורסיבי
+                    video_nodes = recursive_find_video_renderers(raw_data)
+                    logger.info(f"Adaptive Parser discovered {len(video_nodes)} video nodes across the JSON architecture.")
+                    
+                    tracks = []
+                    for vr in video_nodes:
                         video_id = vr.get("videoId")
-                        if not video_id or video_id in seen_ids:
+                        if not video_id:
                             continue
                             
-                        title = vr.get("title", {}).get("runs", [{}])[0].get("text", "שיר ללא שם")
+                        # חילוץ כותרת גמיש
+                        title_runs = vr.get("title", {}).get("runs", [{}])
+                        title = title_runs[0].get("text", "שיר ללא שם") if title_runs else "שיר ללא שם"
+                        
+                        # חילוץ אורך ויוצר
                         duration = vr.get("lengthText", {}).get("simpleText", "00:00")
-                        author = vr.get("longBylineText", {}).get("runs", [{}])[0].get("text", "אמן לא ידוע")
+                        author_runs = vr.get("longBylineText", {}).get("runs", [{}])
+                        author = author_runs[0].get("text", "אמן לא ידוע") if author_runs else "אמן לא ידוע"
                         
                         tracks.append({
                             "id": video_id,
@@ -186,20 +199,16 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
                             "duration": duration,
                             "author": author
                         })
-                        seen_ids.add(video_id)
                         if len(tracks) >= 15:
                             break
                             
                     if tracks:
-                        logger.info(f"Adaptive Parser successfully extracted {len(tracks)} tracks.")
                         if not filter_newest:
                             search_cache[query] = tracks
                         return tracks
-                    else:
-                        logger.warning(f"HTTP 200 OK but Adaptive Parser extracted 0 tracks on attempt {attempt+1}")
             except Exception as e:
-                logger.warning(f"Attempt {attempt+1} failed searching YouTube: {e}")
-                await asyncio.sleep(0.5 * (attempt + 1))
+                logger.warning(f"Error during attempt {attempt+1} scanning InnerTube: {e}")
+                await asyncio.sleep(0.5)
                 
     return []
 
@@ -252,7 +261,6 @@ async def proxy_mp3_stream(video_id: str):
             async with httpx.AsyncClient(timeout=stream_timeout) as client:
                 async with client.stream("GET", target_url, headers={"User-Agent": "Mozilla/5.0"}) as response:
                     if response.status_code not in [200, 206]:
-                        logger.error(f"Target streaming server responded with code {response.status_code}")
                         return
                     async_iterator = response.aiter_bytes(chunk_size=64 * 1024)
                     while True:
@@ -262,10 +270,9 @@ async def proxy_mp3_stream(video_id: str):
                         except StopAsyncIteration:
                             break
                         except asyncio.TimeoutError:
-                            logger.error("Stream chunk read timeout reached.")
                             break
         except Exception as e:
-            logger.error(f"Streaming anomaly detected: {e}")
+            logger.error(f"Streaming exception: {e}")
 
     return StreamingResponse(chunk_generator(), media_type="audio/mpeg")
 
@@ -292,8 +299,7 @@ def get_final_play_command(video_id: str, request: Request) -> str:
     port_suffix = ":10000" if "localhost" in host else ""
     
     stream_url = f"{protocol}://{host}{port_suffix}/stream/{video_id}.mp3"
-    cmd = f"read={stream_url}=ValName,no,1,0,2,digits,no"
-    return cmd
+    return f"read={stream_url}=ValName,no,1,0,2,digits,no"
 
 # ==========================================
 # 🗃️ מנקה סשנים רדומים
@@ -379,6 +385,7 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
                 logger.info("IVR RESPONSE SENT: %s", cmd)
                 return cmd
                 
+            # עדכון ה-State לסטטוס ניגון יחד עם הפלייליסט שנמצא באותו רגע
             await run_db_query("UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?", (json.dumps(tracks), ApiPhone), commit=True)
             cmd = get_final_play_command(tracks[0]["id"], request)
             logger.info("IVR RESPONSE SENT: %s", cmd)
@@ -405,7 +412,6 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
             logger.info("IVR RESPONSE SENT: %s", cmd)
             return cmd
         
-        logger.info(f"Triggering InnerTube search for voice query: {ValName}")
         tracks = await search_youtube_innertube(ValName, filter_newest=False)
         
         if not tracks:
