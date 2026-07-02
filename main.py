@@ -4,6 +4,7 @@ import re
 import asyncio
 import sqlite3
 import logging
+import httpx
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 from fastapi import FastAPI, Query, Request, HTTPException
