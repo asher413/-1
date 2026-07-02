@@ -112,7 +112,7 @@ async def is_rate_limited(phone: str) -> bool:
     return False
 
 # ==========================================
-# 🔍 מנוע חיפושי InnerTube משופר עם Headers ולוגים
+# 🔍 מנוע חיפושי InnerTube
 # ==========================================
 async def search_youtube_innertube(query: str, filter_newest: bool = False) -> List[dict]:
     current_year = datetime.now().year
@@ -136,7 +136,6 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         "query": query
     }
     
-    # 🌟 הוספת ה-Headers הקריטיים שביקשת למניעת תגובות ריקות מיוטיוב
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Content-Type": "application/json",
@@ -148,10 +147,7 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         for attempt in range(3):
             try:
                 response = await client.post(url, json=payload, headers=headers, timeout=4.0)
-                
-                # 🌟 הדפסת 1000 התווים הראשונים של תגובת יוטיוב לניטור המבנה
                 logger.info(f"YouTube InnerTube HTTP Status: {response.status_code}")
-                logger.info(f"YouTube Response Snippet (1000 chars): {response.text[:1000]}")
                 
                 if response.status_code == 200:
                     data = response.json()
@@ -216,7 +212,7 @@ async def fetch_rapidapi_link(video_id: str, client: httpx.AsyncClient) -> Optio
     return None
 
 # ==========================================
-# 🎵 מזריר מדיה אסינכרוני (Streaming Proxy)
+# 🎵 מזרים מדיה אסינכרוני (Streaming Proxy)
 # ==========================================
 @app.get("/stream/{video_id}.mp3")
 async def proxy_mp3_stream(video_id: str):
@@ -254,17 +250,24 @@ async def proxy_mp3_stream(video_id: str):
     return StreamingResponse(chunk_generator(), media_type="audio/mpeg")
 
 # ==========================================
-# 📞 בניית פקודות IVR מתוקנת ומאובטחת מפרוקסי
+# 🧼 פונקציית ניקוי סינטקס ייעודית עבור ימות המשיח
 # ==========================================
+def clean_text_for_ivr(text: str) -> str:
+    """מנקה הרמטית את כל התווים המיוחדים שגורמים לקריסת הפארסר של ימות המשיח"""
+    # השארת אותיות בעברית ובאנגלית, מספרים ורווחים בלבד (מעיף לחלוטין את התו '|')
+    cleaned = re.sub(r'[^a-zA-Z0-9\sא-ת]', ' ', text)
+    # צמצום רווחים כפולים
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
 def make_ivr_read_command(text: str, min_dig: str, max_dig: str, sec: int, mode: str) -> str:
-    clean = text.replace("=", "").replace(",", "").replace("-", "").replace("&", "")
+    clean = clean_text_for_ivr(text)
     if mode.lower() == "voice":
-        return f"read=t-{clean}=ValName,no,50,1,{sec},voice,no&"
+        return f"read=t-{clean}=ValName,no,50,1,{sec},voice,no"
     confirm = "yes" if (max_dig and int(max_dig) > 1) else "no"
-    return f"read=t-{clean}=ValName,no,{max_dig},{min_dig},{sec},{mode.lower()},{confirm}&"
+    return f"read=t-{clean}=ValName,no,{max_dig},{min_dig},{sec},{mode.lower()},{confirm}"
 
 def get_final_play_command(video_id: str, title: str, request: Request) -> str:
-    # 🌟 תיקון קבלת ה-Host מאחורי ה-Proxy של Render כדי למנוע כתובות פנימיות שגויות
     host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
     host = host.split(":")[0]
     
@@ -272,15 +275,14 @@ def get_final_play_command(video_id: str, title: str, request: Request) -> str:
     port_suffix = ":10000" if "localhost" in host else ""
     
     stream_url = f"{protocol}://{host}{port_suffix}/stream/{video_id}.mp3"
-    
-    # 🌟 הדפסת כתובת הסטרימינג שנוצרה כדי לוודא תקינות ציבורית ברנדר
     logger.info(f"Target Stream URL: {stream_url}")
     
-    clean_title = title.replace("=", "").replace("&", "").replace(",", "").replace("-", "").replace(".", "")
+    # ניקוי הכותרת מהתו '|' ומהגבלת אורך להקראה מהירה וחלקלקה
+    clean_title = clean_text_for_ivr(title)[:60]
     announcement = f"מנגן כעת את {clean_title} לשיר הבא הקש 1 לקודם 2 לעצירה 3 לתפריט 0"
     
-    # 🌟 התיקון הקריטי: שילוב id_list_message (ללא חסימה) יחד עם פקודת read בודדת עבור הנגן
-    cmd = f"id_list_message=t-{announcement}&read={stream_url}=ValName,no,1,0,1,digits,no&"
+    # בניית הפקודה ללא תווים שבורים ובסיום נקי (בלי & מיותר בסוף)
+    cmd = f"id_list_message=t-{announcement}&read={stream_url}=ValName,no,1,0,1,digits,no"
     return cmd
 
 # ==========================================
@@ -300,7 +302,7 @@ async def startup_event():
     asyncio.create_task(active_session_cleanup())
 
 # ==========================================
-# 🎛️ הליבה המרכזית: ניהול פרוטוקול ה-IVR האסינכרוני
+# 🎛️ הליבה המרכזית: ניהול פרוטוקול ה-IVR
 # ==========================================
 @app.get("/youtube", response_class=PlainTextResponse)
 async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str = Query(None)):
@@ -350,8 +352,6 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
             return make_ivr_read_command("אנא אמרו את שם השיר המבוקש לאחר הצליל", "1", "50", 10, "voice")
         elif ValName == "2":
             tracks = await search_youtube_innertube("שירים חסידיים", filter_newest=True)
-            
-            # 🌟 הוספת לוגי הניטור שביקשת לבדיקת תוצאות החיפוש
             logger.info(f"Found {len(tracks)} tracks")
             logger.info(tracks)
             
@@ -359,7 +359,6 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
                 return make_ivr_read_command("לא נמצאו שירים כרגע", "1", "1", 3, "digits")
             await run_db_query("UPDATE sessions SET state = 'PLAYING_TRACKS', playlist_json = ?, current_index = 0 WHERE phone = ?", (json.dumps(tracks), ApiPhone), commit=True)
             
-            # 🌟 הפקת פקודה סופית והדפסתה המלאה ללוג לפני ה-return
             cmd = get_final_play_command(tracks[0]["id"], tracks[0]["title"], request)
             logger.info(f"Final IVR Command Response: {cmd}")
             return cmd
@@ -381,8 +380,6 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
             return make_ivr_read_command("לא קלטתי, אנא אמרו את שם השיר בבירור", "1", "50", 10, "voice")
         
         tracks = await search_youtube_innertube(ValName, filter_newest=False)
-        
-        # 🌟 הוספת לוגי הניטור שביקשת לבדיקת תוצאות החיפוש
         logger.info(f"Found {len(tracks)} tracks")
         logger.info(tracks)
         
@@ -395,7 +392,6 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
             (json.dumps(tracks), ApiPhone), commit=True
         )
         
-        # 🌟 הפקת פקודה סופית והדפסתה המלאה ללוג לפני ה-return
         cmd = get_final_play_command(tracks[0]["id"], tracks[0]["title"], request)
         logger.info(f"Final IVR Command Response: {cmd}")
         return cmd
@@ -431,7 +427,6 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
         
         target_track = playlist[index]
         
-        # 🌟 הפקת פקודה סופית והדפסתה המלאה ללוג לפני ה-return
         cmd = get_final_play_command(target_track["id"], target_track["title"], request)
         logger.info(f"Final IVR Command Response: {cmd}")
         return cmd
