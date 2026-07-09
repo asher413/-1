@@ -1,3 +1,27 @@
+"""
+Bulletproof IVR YouTube Engine 2026 — Hardened Edition
+=======================================================
+מנוע IVR חסין: הפעלת שירים מיוטיוב דרך מרכזיה טלפונית (IVR), עם תמיכה
+בסליקת תשלומים (תרומה/מנוי) דרך ספק סליקה חיצוני.
+
+איך להריץ (Render / כל שרת אחר):
+  משתני סביבה חשובים שכדאי להגדיר:
+    IVR_WHITELIST_PHONES=0534133753,0534133754     # טלפונים מורשים אוטומטית
+    IVR_DEFAULT_ACCESS_CODE=1234                    # קוד גישה לכל השאר
+    IVR_PUBLIC_BASE_URL=https://your-app.onrender.com
+    IVR_REQUIRE_PUBLIC_BASE_URL=true
+    RAPIDAPI_KEY=...                                 # אופציונלי
+    CLEARING_API_URL / CLEARING_TERMINAL / CLEARING_API_KEY   # לסליקה, אופציונלי
+    REDIS_URL=...                                    # אופציונלי, קאש משותף בין instances
+
+⚠️ חשוב לגבי הרשימה הלבנה: אם IVR_WHITELIST_PHONES לא מוגדר, שום מספר אינו
+מאושר מראש — כל מתקשר יתבקש להקיש קוד גישה (IVR_DEFAULT_ACCESS_CODE, ברירת
+מחדל "1234" אם לא הוגדר, עם אזהרה בלוג). זו לא תקלה — זו התנהגות מכוונת כדי
+שלא יהיה קוד/מספר "קסום" קשיח בקוד המקור. יש שתי דרכים לפתור את זה:
+  1. הגדירו IVR_WHITELIST_PHONES עם המספרים שרוצים שיעברו בלי קוד.
+  2. או פשוט הקישו את קוד הגישה כשהמערכת מבקשת אותו.
+"""
+
 import os
 import re
 import json
@@ -33,7 +57,7 @@ def utcnow() -> datetime:
 
 
 # ==========================================
-# ⚙️ קונפיגורציה — הכל מ-ENV, שום סוד קשיח
+# ⚙️ קונפיגורציה — הכל מ-ENV, שום סוד קשיח בקוד
 # ==========================================
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")  # ריק => המסלול הזה ידולג בשקט
 RAPIDAPI_HOST = os.environ.get(
@@ -44,43 +68,124 @@ DB_PATH = os.environ.get("IVR_DB_PATH", "ivr_production.db")
 _whitelist_env = os.environ.get("IVR_WHITELIST_PHONES", "")
 DEFAULT_WHITELIST = [p.strip() for p in _whitelist_env.split(",") if p.strip()]
 
-# קוד גישה קבוע — חובה להגדיר ב-ENV בפרודקשן.
-# אם לא הוגדר ב-ENV, המערכת תשתמש בקוד ברירת המחדל "1234"
-DEFAULT_ACCESS_CODE = os.environ.get("IVR_DEFAULT_ACCESS_CODE")
-if not DEFAULT_ACCESS_CODE:
-    DEFAULT_ACCESS_CODE = "1234"  # הגדרת קוד ברירת מחדל קבוע ותקין בגרשיים
-    
-    # הערה: אם תעדיף קוד אקראי שמתחלף בכל הפעלה, החלף את השורה למעלה ב:
-    # DEFAULT_ACCESS_CODE = secrets.token_hex(2)
-    
+# קוד גישה לכל מי שלא ברשימה הלבנה. ברירת המחדל "1234" היא לנוחות התחלתית
+# בלבד (כדי שהמערכת תהיה שמישה מהרגע הראשון) — יש להחליף אותה ב-production
+# ע"י הגדרת IVR_DEFAULT_ACCESS_CODE, אחרת כל מי שמנחש "1234" ייכנס.
+DEFAULT_ACCESS_CODE = os.environ.get("IVR_DEFAULT_ACCESS_CODE", "1234")
+if os.environ.get("IVR_DEFAULT_ACCESS_CODE") is None:
     logger.warning(
         "IVR_DEFAULT_ACCESS_CODE not set! Using default access code: %s "
-        "— set this env var explicitly in production so it doesn't change on restart.",
+        "— set this env var explicitly in production so it's not guessable.",
         DEFAULT_ACCESS_CODE,
     )
 
 if not DEFAULT_WHITELIST:
     logger.warning(
         "IVR_WHITELIST_PHONES not set — no phone numbers are pre-authorized. "
-        "Set it via env var, comma separated, e.g. '0534133753,0534133754'."
+        "Every caller will be asked for the access code (%s). "
+        "Set IVR_WHITELIST_PHONES via env var, comma separated, "
+        "e.g. '0534133753,0534133754' to skip the code for specific numbers.",
+        DEFAULT_ACCESS_CODE,
     )
 
-# בסיס URL ציבורי אופציונלי — אם מוגדר, נשתמש בו במקום לבנות URL מה-headers
-# (headers כמו Host/X-Forwarded-Host יכולים להיות מזויפים ע"י מי ששולח את הבקשה).
+# בסיס URL ציבורי — קריטי לבטיחות. אם לא מוגדר, נופלים חזרה על ה-Host header
+# של הבקשה, שניתן לזיוף ע"י מי ששולח את הבקשה. ב-production מומלץ להגדיר גם
+# IVR_PUBLIC_BASE_URL וגם IVR_REQUIRE_PUBLIC_BASE_URL=true.
 PUBLIC_BASE_URL = os.environ.get("IVR_PUBLIC_BASE_URL", "").rstrip("/")
+REQUIRE_PUBLIC_BASE_URL = os.environ.get("IVR_REQUIRE_PUBLIC_BASE_URL", "false").lower() == "true"
+
+_trusted_hosts_env = os.environ.get("IVR_TRUSTED_HOSTS", "")
+TRUSTED_HOSTS = {h.strip().lower() for h in _trusted_hosts_env.split(",") if h.strip()}
+
+if REQUIRE_PUBLIC_BASE_URL and not PUBLIC_BASE_URL:
+    raise RuntimeError(
+        "IVR_REQUIRE_PUBLIC_BASE_URL=true אך IVR_PUBLIC_BASE_URL לא הוגדר. "
+        "מסרבים לעלות: בניית כתובת ה-callback מ-Host header ניתנת לזיוף."
+    )
+if not PUBLIC_BASE_URL:
+    logger.warning(
+        "IVR_PUBLIC_BASE_URL לא הוגדר — ניפול חזרה על Host header של הבקשה, שניתן לזיוף. "
+        "מומלץ מאוד להגדיר IVR_PUBLIC_BASE_URL (וגם IVR_REQUIRE_PUBLIC_BASE_URL=true) בפרודקשן."
+    )
+
+# תבנית פקודת ה-IVR להפעלת שיר. ההנחה: המרכזיה מבצעת HTTP GET לכתובת שמוחזרת
+# בתוך פקודת read=<url>=... (הקראת קובץ mp3 מרוחק). אם בלוגים אין בקשות ל-
+# /stream/... אחרי שהפקודה חוזרת, סימן שהמרכזיה שלכם דורשת פורמט אחר —
+# אפשר לשנות רק דרך IVR_PLAY_COMMAND_TEMPLATE בלי לגעת בקוד.
+PLAY_COMMAND_TEMPLATE = os.environ.get(
+    "IVR_PLAY_COMMAND_TEMPLATE",
+    "read={base}/stream/{video_id}.mp3=ValName,no,1,0,2,digits,no",
+)
 
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("IVR_RATE_LIMIT_PER_MINUTE", "20"))
 SESSION_TTL_HOURS = int(os.environ.get("IVR_SESSION_TTL_HOURS", "4"))
 MAX_PLAYLIST_SIZE = int(os.environ.get("IVR_MAX_PLAYLIST_SIZE", "15"))
 SEARCH_RECURSION_DEPTH_LIMIT = 40
+DB_READ_POOL_SIZE = max(1, int(os.environ.get("IVR_DB_READ_POOL_SIZE", "4")))
+
+# --- סליקת תשלומים (אופציונלי) -----------------------------------------
+# אדפטר גנרי ל-REST endpoint של ספק סליקה (Cardcom / Tranzila / Yaad Sarig /
+# PayMe וכו'). כל ספק דורש פורמט קצת שונה — מה שכאן הוא שלד עבודה מלא
+# (רישום עסקה, retry-safe, לוגים, שמירת תוצאה) עם נקודת הרחבה יחידה
+# (charge_customer) שיש להתאים לפי מסמכי ה-API של הספק שבחרתם בפועל.
+CLEARING_API_URL = os.environ.get("CLEARING_API_URL", "")
+CLEARING_TERMINAL = os.environ.get("CLEARING_TERMINAL", "")
+CLEARING_API_KEY = os.environ.get("CLEARING_API_KEY", "")
+CLEARING_ENABLED = bool(CLEARING_API_URL and CLEARING_API_KEY)
+DONATION_MIN_ILS = float(os.environ.get("IVR_DONATION_MIN_ILS", "5"))
+DONATION_MAX_ILS = float(os.environ.get("IVR_DONATION_MAX_ILS", "1000"))
+if not CLEARING_ENABLED:
+    logger.info(
+        "Payment clearing not configured (CLEARING_API_URL/CLEARING_API_KEY missing) — "
+        "donation menu option will be disabled."
+    )
+
+# Redis אופציונלי לקאש משותף בין כמה instances. בלי REDIS_URL — TTLCache מקומי.
+REDIS_URL = os.environ.get("REDIS_URL", "")
+_redis = None
+if REDIS_URL:
+    try:
+        import redis.asyncio as _aioredis  # type: ignore
+        _redis = _aioredis.from_url(REDIS_URL, decode_responses=True, socket_timeout=2.0)
+        logger.info("Redis cache enabled (shared across instances).")
+    except ImportError:
+        logger.warning(
+            "REDIS_URL מוגדר אך חבילת redis לא מותקנת (pip install redis) — "
+            "נופלים חזרה על TTLCache מקומי שאינו משותף בין instances."
+        )
+        _redis = None
 
 PHONE_RE = re.compile(r"^\d{9,15}$")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+AMOUNT_RE = re.compile(r"^\d{1,6}$")
 
 search_cache: TTLCache = TTLCache(maxsize=1000, ttl=900)
 stream_url_cache: TTLCache = TTLCache(maxsize=500, ttl=600)
 
-# מנעולים פר-טלפון כדי למנוע מרוץ מצבים בין שתי בקשות מקבילות לאותו מספר.
+
+async def cache_get(local_cache: TTLCache, namespace: str, key: str) -> Optional[str]:
+    if _redis is not None:
+        try:
+            val = await _redis.get(f"{namespace}:{key}")
+            if val is not None:
+                return val
+        except Exception as e:
+            logger.warning("Redis GET failed (%s) — נופל ל-cache מקומי: %s", namespace, e)
+    return local_cache.get(key)
+
+
+async def cache_set(local_cache: TTLCache, namespace: str, key: str, value: str, ttl: int) -> None:
+    local_cache[key] = value
+    if _redis is not None:
+        try:
+            await _redis.set(f"{namespace}:{key}", value, ex=ttl)
+        except Exception as e:
+            logger.warning("Redis SET failed (%s) — הערך נשמר רק מקומית: %s", namespace, e)
+
+
+# מנעולים פר-טלפון: מונעים מרוץ מצבים בין שתי בקשות מקבילות לאותו מספר.
+# כל הלוגיקה של PLAYING_TRACKS (כולל random.shuffle) רצה בתוך המנעול הזה,
+# כך ששתי בקשות מקבילות לאותו טלפון תמיד מתבצעות בסדר, אף פעם בו-זמנית.
 _phone_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -93,7 +198,7 @@ def get_phone_lock(phone: str) -> asyncio.Lock:
 
 
 # ==========================================
-# 🎵 פלייליסט חירום — תמיד עותק עמוק, אף פעם לא האובייקט הגלובלי עצמו
+# 🎵 פלייליסט חירום — תמיד עותק עמוק
 # ==========================================
 _EMERGENCY_PLAYLIST_SOURCE = [
     {"id": "4NzIOLEeJZM", "title": "נחמן פילמר שמחה פורצת גבולות 15", "duration": "1:26:07", "author": "נחמן פילמר"},
@@ -104,13 +209,11 @@ _EMERGENCY_PLAYLIST_SOURCE = [
 
 
 def get_emergency_playlist() -> List[dict]:
-    """עותק עמוק תמיד — כי random.shuffle() ופעולות אחרות עלולות לשבש
-    מצב גלובלי משותף בין כל המתקשרים אם נחזיר רפרנס לאותה רשימה."""
     return copy.deepcopy(_EMERGENCY_PLAYLIST_SOURCE)
 
 
 # ==========================================
-# 🌐 HTTP Client משותף (connection pooling אמיתי)
+# 🌐 HTTP Client משותף
 # ==========================================
 http_client: Optional[httpx.AsyncClient] = None
 
@@ -125,7 +228,8 @@ async def lifespan(app: FastAPI):
                                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
     )
     init_db()
-    cleanup_task = asyncio.create_task(active_session_cleanup())
+    _init_db_pools()
+    cleanup_task = asyncio.create_task(_cleanup_supervisor())
     logger.info("🚀 IVR Engine started")
     try:
         yield
@@ -136,13 +240,17 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         await http_client.aclose()
+        _close_db_pools()
+        if _redis is not None:
+            try:
+                await _redis.aclose()
+            except Exception:
+                pass
         logger.info("🛑 IVR Engine stopped")
 
 
 app = FastAPI(title="Bulletproof IVR YouTube Engine 2026", lifespan=lifespan)
 
-# CORS: allow_origins=["*"] + allow_credentials=True זו קומבינציה לא חוקית/לא בטוחה.
-# זה שרת IVR שלא נצרך מדפדפן עם קרדנצ'לס, אז משביתים credentials.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -159,7 +267,6 @@ def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
     try:
         cursor = conn.cursor()
-        # WAL משפר קונקורנטיות (קריאה תוך כדי כתיבה), busy_timeout מצמצם "database is locked".
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA busy_timeout=5000")
         cursor.execute("PRAGMA foreign_keys=ON")
@@ -195,9 +302,20 @@ def init_db() -> None:
                 timestamp TEXT
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                tx_id TEXT PRIMARY KEY,
+                phone TEXT,
+                amount REAL,
+                status TEXT,
+                provider_response TEXT,
+                created_at TEXT
+            )
+        """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rate_limits_phone_ts ON rate_limits(phone, timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_favorites_phone ON favorites(phone)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_payments_phone ON payments(phone)")
 
         for ph in DEFAULT_WHITELIST:
             if PHONE_RE.match(ph):
@@ -213,35 +331,99 @@ def init_db() -> None:
         conn.close()
 
 
+# --------------------------------------------------------------------------
+# Connection pool: כתיבות מסתדרות דרך חיבור יחיד + מנעול אחד (SQLite ממילא
+# מרשה כותב יחיד בו-זמנית). קריאות (SELECT) מקבלות פול קטן של חיבורים
+# נפרדים לקונקורנטיות אמיתית, וגם חוסכות פתיחה/סגירה של הקובץ בכל בקשה.
+# להיקף גדול משמעותית (מאות שיחות מקבילות) מומלץ לעבור בעתיד ל-Postgres.
+# --------------------------------------------------------------------------
+_write_conn: Optional[sqlite3.Connection] = None
+_write_lock = asyncio.Lock()
+_read_conns: List[sqlite3.Connection] = []
+_read_locks: List[asyncio.Lock] = []
+_read_rr = 0
+
+
+def _open_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=5.0, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _init_db_pools() -> None:
+    global _write_conn, _read_conns, _read_locks
+    _write_conn = _open_conn()
+    _read_conns = [_open_conn() for _ in range(DB_READ_POOL_SIZE)]
+    _read_locks = [asyncio.Lock() for _ in range(DB_READ_POOL_SIZE)]
+    logger.info("DB pools ready: 1 write connection + %d read connections", DB_READ_POOL_SIZE)
+
+
+def _close_db_pools() -> None:
+    global _write_conn, _read_conns
+    try:
+        if _write_conn:
+            _write_conn.close()
+    except Exception:
+        pass
+    for c in _read_conns:
+        try:
+            c.close()
+        except Exception:
+            pass
+    _write_conn = None
+    _read_conns = []
+
+
 async def run_db_query(
     query: str, params: tuple = (), fetchall: bool = False, commit: bool = False
 ):
-    def _execute():
-        conn = sqlite3.connect(DB_PATH, timeout=5.0)
+    global _read_rr
+
+    def _execute(conn: sqlite3.Connection):
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        result = cursor.fetchall() if fetchall else cursor.fetchone()
+        if commit:
+            conn.commit()
+        return result
+
+    if _write_conn is None or not _read_conns:
+        # פול לא אותחל עדיין (למשל שימוש לפני עליית lifespan) — fallback בטוח.
+        def _execute_standalone():
+            conn = _open_conn()
+            try:
+                return _execute(conn)
+            finally:
+                conn.close()
         try:
-            conn.execute("PRAGMA busy_timeout=5000")
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            result = cursor.fetchall() if fetchall else cursor.fetchone()
-            if commit:
-                conn.commit()
-            return result
-        except Exception:
-            if commit:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
+            return await asyncio.get_running_loop().run_in_executor(None, _execute_standalone)
+        except Exception as e:
+            logger.error("DB query failed (standalone): %s | query=%s", e, query)
+            return [] if fetchall else None
 
     try:
-        return await asyncio.get_running_loop().run_in_executor(None, _execute)
+        if commit:
+            async with _write_lock:
+                return await asyncio.get_running_loop().run_in_executor(None, _execute, _write_conn)
+        else:
+            idx = _read_rr % len(_read_conns)
+            _read_rr += 1
+            async with _read_locks[idx]:
+                return await asyncio.get_running_loop().run_in_executor(None, _execute, _read_conns[idx])
     except Exception as e:
         logger.error("DB query failed: %s | query=%s", e, query)
+        if commit and _write_conn is not None:
+            try:
+                _write_conn.rollback()
+            except Exception:
+                pass
         return [] if fetchall else None
 
 
 # ==========================================
-# 🚦 Rate Limiting
+# 🚦 Rate Limiting (בלי DELETE בכל בקשה — רק ספירה; הניקוי בטאסק הרקע)
 # ==========================================
 async def is_rate_limited(phone: str) -> bool:
     if not phone or not PHONE_RE.match(phone):
@@ -249,7 +431,6 @@ async def is_rate_limited(phone: str) -> bool:
     try:
         now = utcnow()
         one_minute_ago = (now - timedelta(minutes=1)).isoformat()
-        await run_db_query("DELETE FROM rate_limits WHERE timestamp < ?", (one_minute_ago,), commit=True)
 
         count_row = await run_db_query(
             "SELECT COUNT(*) FROM rate_limits WHERE phone = ? AND timestamp > ?",
@@ -271,7 +452,7 @@ async def is_rate_limited(phone: str) -> bool:
 
 
 # ==========================================
-# 🔎 חיפוש — InnerTube + Invidious fallback
+# 🔎 חיפוש — InnerTube + regex fallback + Invidious fallback
 # ==========================================
 def _dedupe_and_trim(tracks: List[dict], limit: int = MAX_PLAYLIST_SIZE) -> List[dict]:
     seen = set()
@@ -295,7 +476,7 @@ def extract_tracks_from_innertube(data: dict) -> List[dict]:
 
     def recursive_extract(node, depth: int = 0):
         if depth > SEARCH_RECURSION_DEPTH_LIMIT or len(tracks) >= MAX_PLAYLIST_SIZE * 3:
-            return  # הגנת עומק/גודל — לא נתלה על JSON ענק/עוין
+            return
 
         if isinstance(node, dict):
             renderer = None
@@ -337,6 +518,18 @@ def extract_tracks_from_innertube(data: dict) -> List[dict]:
                 recursive_extract(item, depth + 1)
 
     recursive_extract(data)
+    return _dedupe_and_trim(tracks)
+
+
+_VIDEO_ID_SCAN_RE = re.compile(r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"')
+
+
+def extract_tracks_regex_fallback(raw_text: str) -> List[dict]:
+    """קו הגנה אחרון אם מבנה ה-JSON של InnerTube משתנה ופענוח מובנה נכשל:
+    סריקת regex גולמית לזיהוי videoId בטקסט הגולמי. פחות מדויק (בלי כותרות
+    אמיתיות) אבל עדיף על נפילה מיידית ל-Invidious/פלייליסט חירום."""
+    ids = _VIDEO_ID_SCAN_RE.findall(raw_text or "")
+    tracks = [{"id": vid, "title": "שיר ללא שם", "duration": "00:00", "author": "אמן"} for vid in ids]
     return _dedupe_and_trim(tracks)
 
 
@@ -387,8 +580,12 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         return get_emergency_playlist()
 
     cache_key = f"{'newest:' if filter_newest else ''}{query}"
-    if cache_key in search_cache:
-        return search_cache[cache_key]
+    cached = await cache_get(search_cache, "search", cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except json.JSONDecodeError:
+            pass
 
     url = "https://www.youtube.com/youtubei/v1/search"
     payload = {
@@ -417,14 +614,22 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         resp = await http_client.post(url, json=payload, headers=headers, timeout=7.0)
         logger.info("InnerTube status: %s for query: %s", resp.status_code, query)
         if resp.status_code == 200:
-            raw_data = resp.json()
-            tracks = extract_tracks_from_innertube(raw_data)
+            try:
+                raw_data = resp.json()
+                tracks = extract_tracks_from_innertube(raw_data)
+            except json.JSONDecodeError:
+                tracks = []
+
+            if not tracks:
+                logger.warning("Structured parse got 0 tracks for query=%r — trying regex fallback", query)
+                tracks = extract_tracks_regex_fallback(resp.text)
+
             if tracks:
                 logger.info("✅ InnerTube parsed successfully: %d tracks", len(tracks))
-                search_cache[cache_key] = tracks
+                await cache_set(search_cache, "search", cache_key, json.dumps(tracks, ensure_ascii=False), 900)
                 return tracks
             logger.warning("InnerTube returned 200 but no tracks parsed for query=%r", query)
-    except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+    except (httpx.HTTPError, asyncio.TimeoutError) as e:
         logger.error("InnerTube request failed: %s", e)
 
     logger.info("InnerTube parsing failed → trying Invidious fallback")
@@ -440,11 +645,9 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
 # 🎧 Streaming — עם pre-flight validation לפני שמתחייבים ללקוח
 # ==========================================
 async def _candidate_stream_urls(video_id: str) -> List[str]:
-    """מחזיר רשימת URL-ים מועמדים לפי סדר עדיפות, בלי לבצע עדיין בקשה בפועל."""
     candidates: List[str] = []
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # Cobalt (רק את ה-URL, את הבקשה בפועל נעשה בעת ה-preflight)
     for inst in ["https://api.cobalt.tools/api/json", "https://cobalt.api.v0.wtf/api/json"]:
         candidates.append(f"cobalt::{inst}::{watch_url}")
 
@@ -456,7 +659,6 @@ async def _candidate_stream_urls(video_id: str) -> List[str]:
 
 
 async def _resolve_candidate(candidate: str) -> Optional[str]:
-    """ממיר מועמד ל-URL אמיתי של קובץ מדיה (מבצע בקשת רשת אם צריך)."""
     assert http_client is not None
     try:
         if candidate.startswith("cobalt::"):
@@ -488,35 +690,24 @@ async def _resolve_candidate(candidate: str) -> Optional[str]:
     return None
 
 
-async def fetch_stream_url(video_id: str) -> Optional[str]:
-    """שומר תאימות לאחור: מחזיר את ה-URL הראשון שמצליח להיפתר (ללא preflight מלא)."""
-    if video_id in stream_url_cache:
-        return stream_url_cache[video_id]
-
-    for candidate in await _candidate_stream_urls(video_id):
-        resolved = await _resolve_candidate(candidate)
-        if resolved:
-            stream_url_cache[video_id] = resolved
-            return resolved
-    return None
-
-
 @app.get("/stream/{video_id}.mp3")
 async def proxy_mp3_stream(video_id: str):
     if not VIDEO_ID_RE.match(video_id):
         raise HTTPException(400, "Invalid video ID")
 
     assert http_client is not None
-    candidates = await _candidate_stream_urls(video_id)
+    cached_url = await cache_get(stream_url_cache, "stream", video_id)
+    candidates = ([f"invidious::{cached_url}"] if cached_url else []) + await _candidate_stream_urls(video_id)
 
-    # Pre-flight: לנסות כל מועמד עד שמוצאים אחד שבאמת מחזיר 200,
-    # ורק אז להתחייב ללקוח עם StreamingResponse. כך לא "נתקע" על מקור מת.
     for candidate in candidates:
         target_url = await _resolve_candidate(candidate)
         if not target_url or not target_url.startswith("https://"):
             continue
         try:
-            req = http_client.build_request("GET", target_url)
+            req = http_client.build_request(
+                "GET", target_url,
+                timeout=httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0),
+            )
             resp = await http_client.send(req, stream=True)
         except (httpx.HTTPError, asyncio.TimeoutError) as e:
             logger.warning("Stream preflight failed for %s: %s", candidate[:40], e)
@@ -526,13 +717,15 @@ async def proxy_mp3_stream(video_id: str):
             await resp.aclose()
             continue
 
-        stream_url_cache[video_id] = target_url
+        await cache_set(stream_url_cache, "stream", video_id, target_url, 600)
 
         async def chunk_generator(response: httpx.Response):
             try:
                 async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
                     yield chunk
             except (httpx.HTTPError, asyncio.TimeoutError) as e:
+                # לא ניתן "לתקן" סטרים שכבר החל להישלח ללקוח (headers כבר נשלחו) —
+                # מה שאפשר זה לוודא ניקוי משאבים נקי ולתעד לצורך מעקב/דשבורד.
                 logger.error("Streaming error mid-stream for %s: %s", video_id, e)
             finally:
                 await response.aclose()
@@ -541,6 +734,93 @@ async def proxy_mp3_stream(video_id: str):
 
     logger.error("All stream sources exhausted for video_id=%s", video_id)
     raise HTTPException(502, "No available audio source for this track")
+
+
+# ==========================================
+# 💳 סליקת תשלומים (אופציונלי)
+# ==========================================
+async def charge_customer(phone: str, amount_ils: float) -> Tuple[bool, str, str]:
+    """
+    מבצע חיוב מול ספק הסליקה שהוגדר ב-ENV. זהו אדפטר גנרי ל-REST endpoint —
+    התאימו את שדות הבקשה/תשובה למסמכי ה-API של הספק שלכם בפועל
+    (Cardcom / Tranzila / Yaad Sarig / PayMe...). כל מה שסביב (רישום עסקה,
+    לוגים, טיפול בשגיאות) כבר מוכן ולא צריך לגעת בו.
+    מחזיר: (success, message_for_caller, tx_id)
+    """
+    tx_id = secrets.token_hex(8)
+    if not CLEARING_ENABLED:
+        return False, "שירות התשלומים אינו זמין כרגע", tx_id
+
+    await run_db_query(
+        "INSERT INTO payments (tx_id, phone, amount, status, created_at) VALUES (?, ?, ?, 'pending', ?)",
+        (tx_id, phone, amount_ils, utcnow().isoformat()),
+        commit=True,
+    )
+    try:
+        assert http_client is not None
+        resp = await http_client.post(
+            CLEARING_API_URL,
+            json={
+                "terminal": CLEARING_TERMINAL,
+                "api_key": CLEARING_API_KEY,
+                "amount": amount_ils,
+                "currency": "ILS",
+                "phone": phone,
+                "reference": tx_id,
+            },
+            timeout=10.0,
+        )
+        try:
+            data = resp.json()
+        except json.JSONDecodeError:
+            data = {"raw": resp.text[:500]}
+
+        success = resp.status_code == 200 and bool(
+            data.get("success") or str(data.get("status", "")).lower() == "approved"
+        )
+        status = "approved" if success else "declined"
+        await run_db_query(
+            "UPDATE payments SET status = ?, provider_response = ? WHERE tx_id = ?",
+            (status, json.dumps(data, ensure_ascii=False)[:2000], tx_id),
+            commit=True,
+        )
+        msg = "התשלום אושר, תודה רבה" if success else "התשלום נדחה, אנא נסו כרטיס אחר"
+        return success, msg, tx_id
+    except (httpx.HTTPError, asyncio.TimeoutError) as e:
+        logger.error("Clearing charge failed for tx=%s: %s", tx_id, e)
+        await run_db_query(
+            "UPDATE payments SET status = 'error', provider_response = ? WHERE tx_id = ?",
+            (str(e)[:500], tx_id),
+            commit=True,
+        )
+        return False, "שגיאה בביצוע התשלום, אנא נסו שוב מאוחר יותר", tx_id
+
+
+@app.post("/payment/webhook")
+async def payment_webhook(request: Request):
+    """נקודת קצה אופציונלית לאישורי תשלום א-סינכרוניים מספק הסליקה (אם הוא
+    תומך ב-webhook/IPN). מגן בסיסי: דורש שיתאים tx_id קיים בטבלה. הוסיפו כאן
+    אימות חתימה/סוד משותף לפי מסמכי הספק שלכם לפני production אמיתי."""
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON")
+
+    tx_id = payload.get("reference") or payload.get("tx_id")
+    if not tx_id:
+        raise HTTPException(400, "Missing reference/tx_id")
+
+    row = await run_db_query("SELECT tx_id FROM payments WHERE tx_id = ?", (tx_id,))
+    if not row:
+        raise HTTPException(404, "Unknown transaction")
+
+    status = "approved" if payload.get("success") else "declined"
+    await run_db_query(
+        "UPDATE payments SET status = ?, provider_response = ? WHERE tx_id = ?",
+        (status, json.dumps(payload, ensure_ascii=False)[:2000], tx_id),
+        commit=True,
+    )
+    return {"ok": True}
 
 
 # ==========================================
@@ -558,33 +838,68 @@ def make_ivr_read_command(text: str, min_dig: str, max_dig: str, sec: int, mode:
     return f"read=t-{clean}=ValName,no,{max_dig},{min_dig},{sec},{mode.lower()},no"
 
 
-def get_final_play_command(video_id: str, request: Request) -> str:
+def get_final_play_command(video_id: str, request: Request) -> Optional[str]:
     if PUBLIC_BASE_URL:
         base = PUBLIC_BASE_URL
     else:
-        host = (request.headers.get("x-forwarded-host") or request.headers.get("host", "")).split(":")[0]
+        host = (request.headers.get("x-forwarded-host") or request.headers.get("host", "")).split(":")[0].lower()
+        if TRUSTED_HOSTS and host not in TRUSTED_HOSTS:
+            logger.error("Rejected untrusted Host header for play command: %r", host)
+            return None
         protocol = request.headers.get("x-forwarded-proto") or ("http" if "localhost" in host else "https")
         port = ":10000" if "localhost" in host else ""
         base = f"{protocol}://{host}{port}"
-    return f"read={base}/stream/{video_id}.mp3=ValName,no,1,0,2,digits,no"
+    return PLAY_COMMAND_TEMPLATE.format(base=base, video_id=video_id)
+
+
+def _generic_error_command() -> str:
+    return make_ivr_read_command("משהו השתבש אנא נסו שוב מאוחר יותר", "1", "1", 5, "digits")
+
+
+def _play_command_or_error(video_id: str, request: Request) -> str:
+    cmd = get_final_play_command(video_id, request)
+    return cmd if cmd is not None else _generic_error_command()
 
 
 # ==========================================
-# 🧹 Background cleanup
+# 🧹 Background cleanup + watchdog
 # ==========================================
+async def _cleanup_once() -> None:
+    cutoff = (utcnow() - timedelta(hours=SESSION_TTL_HOURS)).isoformat()
+    await run_db_query("DELETE FROM sessions WHERE last_active < ?", (cutoff,), commit=True)
+
+    one_hour_ago = (utcnow() - timedelta(hours=1)).isoformat()
+    await run_db_query("DELETE FROM rate_limits WHERE timestamp < ?", (one_hour_ago,), commit=True)
+
+    for ph in list(_phone_locks.keys()):
+        lock = _phone_locks.get(ph)
+        if lock and not lock.locked():
+            _phone_locks.pop(ph, None)
+
+
 async def active_session_cleanup():
     while True:
         try:
-            cutoff = (utcnow() - timedelta(hours=SESSION_TTL_HOURS)).isoformat()
-            await run_db_query("DELETE FROM sessions WHERE last_active < ?", (cutoff,), commit=True)
-            # גם ננקה מנעולים ישנים כדי לא לדלוף זיכרון עם הרבה מספרים לאורך זמן
-            for ph in list(_phone_locks.keys()):
-                lock = _phone_locks.get(ph)
-                if lock and not lock.locked():
-                    _phone_locks.pop(ph, None)
+            await _cleanup_once()
         except Exception as e:
-            logger.error("Cleanup failed: %s", e)
+            logger.error("Cleanup iteration failed: %s", e)
         await asyncio.sleep(1800)
+
+
+async def _cleanup_supervisor():
+    """עוטף את משימת הניקוי ומרים אותה מחדש אם היא קורסת מסיבה בלתי צפויה,
+    כדי שלעולם לא "נשכח" עם sessions/rate_limits שהולכים ותופחים."""
+    backoff = 5
+    while True:
+        try:
+            await active_session_cleanup()
+            return  # לא אמור לקרות (לולאה אינסופית), אבל ליתר ביטחון
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("Cleanup task crashed, restarting in %ss: %s", backoff, e)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 300)
 
 
 # ==========================================
@@ -595,13 +910,24 @@ class State(str, Enum):
     MAIN_MENU = "MAIN_MENU"
     WAITING_FOR_SEARCH = "WAITING_FOR_SEARCH"
     PLAYING_TRACKS = "PLAYING_TRACKS"
+    WAITING_FOR_DONATION_AMOUNT = "WAITING_FOR_DONATION_AMOUNT"
 
 
-ERROR_FALLBACK_CMD = None  # מוגדר בהמשך אחרי הפונקציה כדי להימנע מ-forward ref
+MAIN_MENU_TEXT = (
+    "לחיפוש קולי 1 • שירים חדשים 2 • מועדפים 3"
+    + (" • תרומה 9" if CLEARING_ENABLED else "")
+)
 
 
-def _generic_error_command() -> str:
-    return make_ivr_read_command("משהו השתבש אנא נסו שוב מאוחר יותר", "1", "1", 5, "digits")
+async def _save_session(phone: str, state: str, playlist: List[dict], index: int) -> None:
+    """כותב state + playlist_json + current_index יחד, תמיד באותה קריאה —
+    כדי שה-DB וה-RAM לעולם לא יתפצלו לגרסאות לא-מסונכרנות (state ישן מול
+    פלייליסט חדש וכד')."""
+    await run_db_query(
+        "UPDATE sessions SET state = ?, playlist_json = ?, current_index = ? WHERE phone = ?",
+        (state, json.dumps(playlist, ensure_ascii=False), index, phone),
+        commit=True,
+    )
 
 
 async def _load_or_create_session(phone: str, is_whitelisted: bool) -> Tuple[str, List[dict], int]:
@@ -675,10 +1001,8 @@ async def _handle_ivr_locked(request: Request, ApiPhone: str, ValName: Optional[
                 (ApiPhone, stored_access_code),
                 commit=True,
             )
-            await run_db_query(
-                "UPDATE sessions SET state = ? WHERE phone = ?", (State.MAIN_MENU.value, ApiPhone), commit=True
-            )
             state = State.MAIN_MENU.value
+            await _save_session(ApiPhone, state, [], 0)
             ValName = None
         else:
             msg = "קוד שגוי אנא נסה שנית" if ValName else "אנא הקש את קוד הגישה"
@@ -687,21 +1011,15 @@ async def _handle_ivr_locked(request: Request, ApiPhone: str, ValName: Optional[
     # ---------- MAIN MENU ----------
     if state == State.MAIN_MENU.value:
         if ValName == "1":
-            await run_db_query(
-                "UPDATE sessions SET state = ? WHERE phone = ?", (State.WAITING_FOR_SEARCH.value, ApiPhone), commit=True
-            )
+            await _save_session(ApiPhone, State.WAITING_FOR_SEARCH.value, [], 0)
             return make_ivr_read_command("אנא אמרו את שם השיר לאחר הצליל", "1", "50", 10, "voice")
 
         elif ValName == "2":
             tracks = await search_youtube_innertube("שירים חסידיים חדשים", filter_newest=True)
             if not tracks:
                 tracks = get_emergency_playlist()
-            await run_db_query(
-                "UPDATE sessions SET state = ?, playlist_json = ?, current_index = 0 WHERE phone = ?",
-                (State.PLAYING_TRACKS.value, json.dumps(tracks, ensure_ascii=False), ApiPhone),
-                commit=True,
-            )
-            return get_final_play_command(tracks[0]["id"], request)
+            await _save_session(ApiPhone, State.PLAYING_TRACKS.value, tracks, 0)
+            return _play_command_or_error(tracks[0]["id"], request)
 
         elif ValName == "3":
             favs = await run_db_query(
@@ -711,15 +1029,18 @@ async def _handle_ivr_locked(request: Request, ApiPhone: str, ValName: Optional[
             if not favs:
                 return make_ivr_read_command("רשימת המועדפים ריקה", "1", "1", 4, "digits")
             tracks = [{"id": f[0], "title": f[1], "duration": "00:00", "author": ""} for f in favs]
-            await run_db_query(
-                "UPDATE sessions SET state = ?, playlist_json = ?, current_index = 0 WHERE phone = ?",
-                (State.PLAYING_TRACKS.value, json.dumps(tracks, ensure_ascii=False), ApiPhone),
-                commit=True,
+            await _save_session(ApiPhone, State.PLAYING_TRACKS.value, tracks, 0)
+            return _play_command_or_error(tracks[0]["id"], request)
+
+        elif ValName == "9" and CLEARING_ENABLED:
+            await _save_session(ApiPhone, State.WAITING_FOR_DONATION_AMOUNT.value, [], 0)
+            return make_ivr_read_command(
+                f"הקישו סכום לתרומה בשקלים בין {int(DONATION_MIN_ILS)} ל {int(DONATION_MAX_ILS)} ואז סולמית",
+                "1", "6", 12, "digits",
             )
-            return get_final_play_command(tracks[0]["id"], request)
 
         else:
-            return make_ivr_read_command("לחיפוש קולי 1 • שירים חדשים 2 • מועדפים 3", "1", "1", 10, "digits")
+            return make_ivr_read_command(MAIN_MENU_TEXT, "1", "1", 10, "digits")
 
     # ---------- SEARCH ----------
     elif state == State.WAITING_FOR_SEARCH.value:
@@ -730,21 +1051,31 @@ async def _handle_ivr_locked(request: Request, ApiPhone: str, ValName: Optional[
         if not tracks:
             tracks = get_emergency_playlist()
 
-        await run_db_query(
-            "UPDATE sessions SET state = ?, playlist_json = ?, current_index = 0 WHERE phone = ?",
-            (State.PLAYING_TRACKS.value, json.dumps(tracks, ensure_ascii=False), ApiPhone),
-            commit=True,
-        )
-        return get_final_play_command(tracks[0]["id"], request)
+        await _save_session(ApiPhone, State.PLAYING_TRACKS.value, tracks, 0)
+        return _play_command_or_error(tracks[0]["id"], request)
+
+    # ---------- DONATION AMOUNT ----------
+    elif state == State.WAITING_FOR_DONATION_AMOUNT.value:
+        if not ValName or not AMOUNT_RE.match(ValName):
+            return make_ivr_read_command("סכום לא תקין, אנא הקישו שוב מספר בשקלים", "1", "6", 10, "digits")
+
+        amount = float(ValName)
+        if amount < DONATION_MIN_ILS or amount > DONATION_MAX_ILS:
+            return make_ivr_read_command(
+                f"הסכום חייב להיות בין {int(DONATION_MIN_ILS)} ל {int(DONATION_MAX_ILS)} שקלים",
+                "1", "6", 10, "digits",
+            )
+
+        success, message, tx_id = await charge_customer(ApiPhone, amount)
+        logger.info("Payment attempt tx=%s phone=%s amount=%s success=%s", tx_id, ApiPhone, amount, success)
+        await _save_session(ApiPhone, State.MAIN_MENU.value, [], 0)
+        return make_ivr_read_command(message, "1", "1", 6, "digits")
 
     # ---------- PLAYING ----------
     elif state == State.PLAYING_TRACKS.value:
         if not playlist:
             playlist = get_emergency_playlist()
-            await run_db_query(
-                "UPDATE sessions SET playlist_json = ? WHERE phone = ?",
-                (json.dumps(playlist, ensure_ascii=False), ApiPhone), commit=True,
-            )
+            index = 0
 
         total = len(playlist)
         index = (index % total) if total > 0 else 0
@@ -752,14 +1083,11 @@ async def _handle_ivr_locked(request: Request, ApiPhone: str, ValName: Optional[
         if ValName == "2":
             index = (index - 1) % total
         elif ValName == "3":
+            # משהים: לא כותבים ל-DB (אין שינוי state/playlist/index אמיתי)
             return make_ivr_read_command("הושהה • להמשך 4 • תפריט 0", "1", "1", 20, "digits")
         elif ValName == "5":
             random.shuffle(playlist)
             index = 0
-            await run_db_query(
-                "UPDATE sessions SET playlist_json = ? WHERE phone = ?",
-                (json.dumps(playlist, ensure_ascii=False), ApiPhone), commit=True,
-            )
         elif ValName == "6":
             curr = playlist[index]
             await run_db_query(
@@ -767,29 +1095,24 @@ async def _handle_ivr_locked(request: Request, ApiPhone: str, ValName: Optional[
                 (ApiPhone, curr["id"], curr["title"], utcnow().isoformat()),
                 commit=True,
             )
+            # אין שינוי לפלייליסט/אינדקס — רק פידבק, וממשיכים לנגן את אותו שיר.
             return make_ivr_read_command("נוסף למועדפים • ממשיך...", "1", "1", 3, "digits")
         elif ValName == "0":
-            await run_db_query(
-                "UPDATE sessions SET state = ?, playlist_json = '[]', current_index = 0 WHERE phone = ?",
-                (State.MAIN_MENU.value, ApiPhone), commit=True,
-            )
+            await _save_session(ApiPhone, State.MAIN_MENU.value, [], 0)
             return make_ivr_read_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
         else:
             # ValName == "1" (הבא) או "" (ללא קלט / טיימאאוט) => מעבר לשיר הבא כברירת מחדל
             index = (index + 1) % total
 
-        await run_db_query(
-            "UPDATE sessions SET current_index = ? WHERE phone = ?", (index, ApiPhone), commit=True
-        )
-        return get_final_play_command(playlist[index]["id"], request)
+        # כתיבה אטומית יחידה: state + playlist_json + current_index תמיד יחד,
+        # כך ש-DB וה-RAM לעולם לא מתפצלים לגרסאות לא-מסונכרנות.
+        await _save_session(ApiPhone, State.PLAYING_TRACKS.value, playlist, index)
+        return _play_command_or_error(playlist[index]["id"], request)
 
     # מצב לא מוכר — נאפס בבטחה חזרה לתפריט במקום לתקוע את השיחה
     logger.warning("Unknown session state %r for phone=%s — resetting", state, ApiPhone)
-    await run_db_query(
-        "UPDATE sessions SET state = ?, playlist_json = '[]', current_index = 0 WHERE phone = ?",
-        (State.MAIN_MENU.value, ApiPhone), commit=True,
-    )
-    return make_ivr_read_command("לחיפוש קולי 1 • שירים חדשים 2 • מועדפים 3", "1", "1", 10, "digits")
+    await _save_session(ApiPhone, State.MAIN_MENU.value, [], 0)
+    return make_ivr_read_command(MAIN_MENU_TEXT, "1", "1", 10, "digits")
 
 
 # ==========================================
@@ -802,5 +1125,11 @@ async def health():
         await run_db_query("SELECT 1")
     except Exception:
         db_ok = False
-    return {"status": "ok" if db_ok else "degraded", "db": db_ok, "time": utcnow().isoformat()}
-
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "db": db_ok,
+        "clearing_enabled": CLEARING_ENABLED,
+        "redis_enabled": _redis is not None,
+        "whitelist_count": len(DEFAULT_WHITELIST),
+        "time": utcnow().isoformat(),
+    }
