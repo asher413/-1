@@ -647,36 +647,40 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         except json.JSONDecodeError:
             pass
 
-    url = f"https://www.youtube.com/youtubei/v1/search?key={INNERTUBE_KEY}&prettyPrint=false"
+    # הגדרת הכתובת של הפרוקסי שלך
+    proxy_url = "https://shiny-union-ba59.a41337sh.workers.dev"
+    url = f"{proxy_url}/youtubei/v1/search?key={INNERTUBE_KEY}&prettyPrint=false"
+    
+    # שינוי ל-ANDROID כדי לעקוף את החסימה של יוטיוב
     payload = {
         "context": {
             "client": {
-                "clientName": "WEB",
-                "clientVersion": "2.20260601.01.00",
+                "clientName": "ANDROID",
+                "clientVersion": "17.20.39",
+                "androidSdkVersion": 31,
                 "hl": "he",
                 "gl": "IL",
-                "platform": "DESKTOP",
-                "clientFormFactor": "UNKNOWN_FORM_FACTOR",
+                "clientFormFactor": "SMALL_FORM_FACTOR",
             }
         },
         "query": query,
     }
     if filter_newest:
-        payload["params"] = "EgQIARAB"  # מיון לפי תאריך העלאה
+        payload["params"] = "EgQIARAB"
 
     headers = {
         "Content-Type": "application/json",
         "Origin": "https://www.youtube.com",
         "Referer": "https://www.youtube.com/",
-        "X-YouTube-Client-Name": "1",
-        "X-YouTube-Client-Version": "2.20260601.01.00",
+        "User-Agent": "com.google.android.youtube/17.20.39 (Linux; U; Android 11; il)",
     }
 
     tracks: List[dict] = []
     try:
         assert http_client is not None
-        resp = await http_client.post(url, json=payload, headers=headers, timeout=7.0)
+        resp = await http_client.post(url, json=payload, headers=headers, timeout=10.0)
         logger.info("InnerTube status: %s for query: %s", resp.status_code, query)
+        
         if resp.status_code == 200:
             try:
                 raw_data = resp.json()
@@ -685,7 +689,7 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
                 tracks = []
 
             if not tracks:
-                logger.warning("Structured parse got 0 tracks for query=%r — trying regex fallback", query)
+                logger.warning("Structured parse got 0 tracks — trying regex fallback")
                 tracks = extract_tracks_regex_fallback(resp.text)
 
             if tracks:
@@ -693,17 +697,11 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
                 await cache_set(search_cache, "search", cache_key, json.dumps(tracks, ensure_ascii=False), 900)
                 return tracks
 
-            # אבחון: אם גם ה-regex לא מצא כלום, כנראה יוטיוב לא החזירה בכלל
-            # תשובת חיפוש רגילה (למשל דף הסכמה/חסימת IP של דאטהסנטר). שורה
-            # אחת בלוג עם תחילת הגוף עוזרת לאבחן בלי צורך לשחזר את הבעיה שוב.
-            logger.warning(
-                "InnerTube returned 200 but 0 tracks (structured+regex) for query=%r. "
-                "Response looks like: %s",
-                query, resp.text[:200].replace("\n", " "),
-            )
+            logger.warning("InnerTube returned 200 but 0 tracks for query=%r.", query)
     except (httpx.HTTPError, asyncio.TimeoutError) as e:
         logger.error("InnerTube request failed: %s", e)
 
+    # Fallbacks
     logger.info("InnerTube parsing failed → trying Invidious fallback")
     fallback_tracks = await search_invidious_fallback(query)
     if fallback_tracks:
