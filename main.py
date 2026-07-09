@@ -121,7 +121,10 @@ RATE_LIMIT_PER_MINUTE = int(os.environ.get("IVR_RATE_LIMIT_PER_MINUTE", "20"))
 SESSION_TTL_HOURS = int(os.environ.get("IVR_SESSION_TTL_HOURS", "4"))
 MAX_PLAYLIST_SIZE = int(os.environ.get("IVR_MAX_PLAYLIST_SIZE", "15"))
 SEARCH_RECURSION_DEPTH_LIMIT = 40
-DB_READ_POOL_SIZE = max(1, int(os.environ.get("IVR_DB_READ_POOL_SIZE", "4")))
+DB_READ_POOL_SIZE = max(1, int(os.environ.get("IVR_DB_READ_POOL_SIZE", "8")))
+
+# מספרים "חסויים" ששולחות מרכזיות שונות כשהמתקשר חסם הצגת מספר.
+ANONYMOUS_PHONE_VALUES = {"0", "", "anonymous", "unknown", "withheld", "unavailable"}
 
 # --- סליקת תשלומים (אופציונלי) -----------------------------------------
 # אדפטר גנרי ל-REST endpoint של ספק סליקה (Cardcom / Tranzila / Yaad Sarig /
@@ -158,6 +161,22 @@ if REDIS_URL:
 PHONE_RE = re.compile(r"^\d{9,15}$")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 AMOUNT_RE = re.compile(r"^\d{1,6}$")
+
+# מפתח ה-API הציבורי שקליינט הווב של יוטיוב שולח בפועל. בלעדיו InnerTube
+# נוטה להחזיר תשובת 200 "ריקה" (בלי תוצאות) במקום שגיאה — בדיוק התופעה
+# שראינו בלוגים. ניתן לדרוס אם יוטיוב ישנה אותו (מפתח ציבורי, לא סוד).
+INNERTUBE_KEY = os.environ.get("IVR_INNERTUBE_KEY", "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8")
+
+# רשימות שרתי Invidious/Piped ניתנות לעדכון דרך ENV בלי לגעת בקוד — רשימות
+# כאלה "מתות" ומתחלפות כל הזמן, אז חשוב שלא יהיו קשיחות בקוד באופן בלעדי.
+_default_invidious = "https://invidious.projectsegfau.lt,https://yewtu.be,https://invidious.fdn.fr,https://iv.ggtyler.dev"
+_default_piped = "https://pipedapi.kavin.rocks,https://api-piped.mha.fi,https://piped-api.lunar.icu"
+INVIDIOUS_INSTANCES = [i.strip() for i in os.environ.get("IVR_INVIDIOUS_INSTANCES", _default_invidious).split(",") if i.strip()]
+PIPED_INSTANCES = [i.strip() for i in os.environ.get("IVR_PIPED_INSTANCES", _default_piped).split(",") if i.strip()]
+
+# טוקן אופציונלי לחשוף endpoint אבחון לבדיקת חיפוש בלי לחכות לשיחת טלפון.
+# בלי IVR_DEBUG_TOKEN, ה-endpoint מנוטרל לגמרי (404).
+DEBUG_TOKEN = os.environ.get("IVR_DEBUG_TOKEN", "")
 
 search_cache: TTLCache = TTLCache(maxsize=1000, ttl=900)
 stream_url_cache: TTLCache = TTLCache(maxsize=500, ttl=600)
@@ -425,8 +444,10 @@ async def run_db_query(
 # ==========================================
 # 🚦 Rate Limiting (בלי DELETE בכל בקשה — רק ספירה; הניקוי בטאסק הרקע)
 # ==========================================
-async def is_rate_limited(phone: str) -> bool:
-    if not phone or not PHONE_RE.match(phone):
+async def is_rate_limited(session_key: str) -> bool:
+    # הוולידציה של phone/anon כבר בוצעה ב-handle_ivr לפני שהגענו לכאן — כאן רק
+    # מוודאים שיש מפתח לא-ריק (יכול להיות "0501234567" או "anon:<call_id>").
+    if not session_key:
         return True
     try:
         now = utcnow()
@@ -434,7 +455,7 @@ async def is_rate_limited(phone: str) -> bool:
 
         count_row = await run_db_query(
             "SELECT COUNT(*) FROM rate_limits WHERE phone = ? AND timestamp > ?",
-            (phone, one_minute_ago),
+            (session_key, one_minute_ago),
         )
         count = count_row[0] if count_row else 0
         if count >= RATE_LIMIT_PER_MINUTE:
@@ -442,7 +463,7 @@ async def is_rate_limited(phone: str) -> bool:
 
         await run_db_query(
             "INSERT INTO rate_limits (phone, timestamp) VALUES (?, ?)",
-            (phone, now.isoformat()),
+            (session_key, now.isoformat()),
             commit=True,
         )
         return False
@@ -534,14 +555,8 @@ def extract_tracks_regex_fallback(raw_text: str) -> List[dict]:
 
 
 async def search_invidious_fallback(query: str) -> List[dict]:
-    instances = [
-        "https://invidious.projectsegfau.lt",
-        "https://vid.puffyan.us",
-        "https://invidious.nerdvpn.de",
-        "https://inv.tux.digital",
-    ]
     assert http_client is not None
-    for inst in instances:
+    for inst in INVIDIOUS_INSTANCES:
         try:
             resp = await http_client.get(
                 f"{inst}/api/v1/search", params={"q": query, "type": "video"}, timeout=6.0
@@ -574,6 +589,51 @@ async def search_invidious_fallback(query: str) -> List[dict]:
     return []
 
 
+async def search_piped_fallback(query: str) -> List[dict]:
+    """שכבת fallback נוספת (Piped) — פורמט ותוכן instances שונים מ-Invidious,
+    כך ששני השירותים לא נופלים יחד באותו סוג תקלה (שרת מסוים חסום/מת)."""
+    assert http_client is not None
+    for inst in PIPED_INSTANCES:
+        try:
+            resp = await http_client.get(
+                f"{inst}/search", params={"q": query, "filter": "videos"}, timeout=6.0
+            )
+            if resp.status_code != 200:
+                continue
+            try:
+                data = resp.json()
+            except json.JSONDecodeError:
+                logger.warning("Piped %s returned non-JSON", inst)
+                continue
+
+            items = data.get("items", []) if isinstance(data, dict) else []
+            tracks = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                url_path = item.get("url", "")  # e.g. "/watch?v=XXXXXXXXXXX"
+                m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", url_path)
+                if not m:
+                    continue
+                secs = item.get("duration")
+                duration = f"{secs // 60}:{secs % 60:02d}" if isinstance(secs, int) and secs >= 0 else "00:00"
+                tracks.append({
+                    "id": m.group(1),
+                    "title": item.get("title", "שיר ללא שם"),
+                    "duration": duration,
+                    "author": item.get("uploaderName", "אמן"),
+                })
+
+            tracks = _dedupe_and_trim(tracks, limit=12)
+            if tracks:
+                logger.info("✅ Piped success via %s: %d tracks", inst, len(tracks))
+                return tracks
+        except (httpx.HTTPError, asyncio.TimeoutError) as e:
+            logger.warning("Piped %s failed: %s", inst, e)
+            continue
+    return []
+
+
 async def search_youtube_innertube(query: str, filter_newest: bool = False) -> List[dict]:
     query = (query or "").strip()[:150]
     if not query:
@@ -587,7 +647,7 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         except json.JSONDecodeError:
             pass
 
-    url = "https://www.youtube.com/youtubei/v1/search"
+    url = f"https://www.youtube.com/youtubei/v1/search?key={INNERTUBE_KEY}&prettyPrint=false"
     payload = {
         "context": {
             "client": {
@@ -595,6 +655,8 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
                 "clientVersion": "2.20260601.01.00",
                 "hl": "he",
                 "gl": "IL",
+                "platform": "DESKTOP",
+                "clientFormFactor": "UNKNOWN_FORM_FACTOR",
             }
         },
         "query": query,
@@ -606,6 +668,8 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         "Content-Type": "application/json",
         "Origin": "https://www.youtube.com",
         "Referer": "https://www.youtube.com/",
+        "X-YouTube-Client-Name": "1",
+        "X-YouTube-Client-Version": "2.20260601.01.00",
     }
 
     tracks: List[dict] = []
@@ -628,13 +692,28 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
                 logger.info("✅ InnerTube parsed successfully: %d tracks", len(tracks))
                 await cache_set(search_cache, "search", cache_key, json.dumps(tracks, ensure_ascii=False), 900)
                 return tracks
-            logger.warning("InnerTube returned 200 but no tracks parsed for query=%r", query)
+
+            # אבחון: אם גם ה-regex לא מצא כלום, כנראה יוטיוב לא החזירה בכלל
+            # תשובת חיפוש רגילה (למשל דף הסכמה/חסימת IP של דאטהסנטר). שורה
+            # אחת בלוג עם תחילת הגוף עוזרת לאבחן בלי צורך לשחזר את הבעיה שוב.
+            logger.warning(
+                "InnerTube returned 200 but 0 tracks (structured+regex) for query=%r. "
+                "Response looks like: %s",
+                query, resp.text[:200].replace("\n", " "),
+            )
     except (httpx.HTTPError, asyncio.TimeoutError) as e:
         logger.error("InnerTube request failed: %s", e)
 
     logger.info("InnerTube parsing failed → trying Invidious fallback")
     fallback_tracks = await search_invidious_fallback(query)
     if fallback_tracks:
+        await cache_set(search_cache, "search", cache_key, json.dumps(fallback_tracks, ensure_ascii=False), 900)
+        return fallback_tracks
+
+    logger.info("Invidious failed → trying Piped fallback")
+    fallback_tracks = await search_piped_fallback(query)
+    if fallback_tracks:
+        await cache_set(search_cache, "search", cache_key, json.dumps(fallback_tracks, ensure_ascii=False), 900)
         return fallback_tracks
 
     logger.warning("All search backends failed → Emergency playlist")
@@ -706,7 +785,10 @@ async def proxy_mp3_stream(video_id: str):
         try:
             req = http_client.build_request(
                 "GET", target_url,
-                timeout=httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0),
+                # read=None: זו הזרמת אודיו ארוכת-טווח שהמרכזיה עשויה "להשהות" בפועל
+                # (buffer איטי מצידה) — טיימאאוט קריאה קצוב היה מנתק שירים תקינים
+                # באמצע. connect/write נשארים קצובים כדי לא להיתקע על מקור מת.
+                timeout=httpx.Timeout(connect=5.0, read=None, write=10.0, pool=5.0),
             )
             resp = await http_client.send(req, stream=True)
         except (httpx.HTTPError, asyncio.TimeoutError) as e:
@@ -739,6 +821,18 @@ async def proxy_mp3_stream(video_id: str):
 # ==========================================
 # 💳 סליקת תשלומים (אופציונלי)
 # ==========================================
+def _safe_json_snippet(data, limit: int = 2000) -> str:
+    """שומר תמיד JSON תקין (אף פעם לא נחתך באמצע), גם כשהתשובה מהספק ענקית —
+    כדי שקריאה עתידית עם json.loads() לא תיפול."""
+    try:
+        full = json.dumps(data, ensure_ascii=False)
+    except (TypeError, ValueError):
+        full = str(data)
+    if len(full) <= limit:
+        return full
+    return json.dumps({"_truncated": True, "raw_prefix": full[: max(0, limit - 60)]}, ensure_ascii=False)
+
+
 async def charge_customer(phone: str, amount_ils: float) -> Tuple[bool, str, str]:
     """
     מבצע חיוב מול ספק הסליקה שהוגדר ב-ENV. זהו אדפטר גנרי ל-REST endpoint —
@@ -781,7 +875,7 @@ async def charge_customer(phone: str, amount_ils: float) -> Tuple[bool, str, str
         status = "approved" if success else "declined"
         await run_db_query(
             "UPDATE payments SET status = ?, provider_response = ? WHERE tx_id = ?",
-            (status, json.dumps(data, ensure_ascii=False)[:2000], tx_id),
+            (status, _safe_json_snippet(data), tx_id),
             commit=True,
         )
         msg = "התשלום אושר, תודה רבה" if success else "התשלום נדחה, אנא נסו כרטיס אחר"
@@ -817,7 +911,7 @@ async def payment_webhook(request: Request):
     status = "approved" if payload.get("success") else "declined"
     await run_db_query(
         "UPDATE payments SET status = ?, provider_response = ? WHERE tx_id = ?",
-        (status, json.dumps(payload, ensure_ascii=False)[:2000], tx_id),
+        (status, _safe_json_snippet(payload), tx_id),
         commit=True,
     )
     return {"ok": True}
@@ -842,7 +936,10 @@ def get_final_play_command(video_id: str, request: Request) -> Optional[str]:
     if PUBLIC_BASE_URL:
         base = PUBLIC_BASE_URL
     else:
-        host = (request.headers.get("x-forwarded-host") or request.headers.get("host", "")).split(":")[0].lower()
+        raw_host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+        # מאחורי כמה פרוקסים בשרשרת (למשל Cloudflare + Render) הכותרת עלולה
+        # להכיל כמה ערכים מופרדים בפסיק ("host1, host2") — הראשון הוא המקורי.
+        host = raw_host.split(",")[0].strip().split(":")[0].lower()
         if TRUSTED_HOSTS and host not in TRUSTED_HOSTS:
             logger.error("Rejected untrusted Host header for play command: %r", host)
             return None
@@ -959,33 +1056,59 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
     if hangup == "yes" or not ApiPhone:
         return "OK"
 
-    ApiPhone = ApiPhone.strip()
-    if not PHONE_RE.match(ApiPhone):
-        logger.warning("Rejected malformed phone: %r", ApiPhone)
-        return "OK"
+    raw_phone = ApiPhone.strip()
+    is_anonymous = raw_phone.lower() in ANONYMOUS_PHONE_VALUES
+
+    if is_anonymous:
+        # מתקשר עם מספר חסום. אי אפשר לזהות אותו לאורך זמן (וגם לא כדאי —
+        # אין למה "לזכור"), אבל חובה לתת לו session_key ייחודי לשיחה הנוכחית
+        # (ApiCallId/ApiYFCallId) ולא "0" קבוע — אחרת כל המתקשרים החסויים
+        # היו חולקים session אחד וקופצים על הפלייליסט/מצב אחד של השני.
+        call_id = (
+            request.query_params.get("ApiCallId")
+            or request.query_params.get("ApiYFCallId")
+            or ""
+        ).strip()
+        if not call_id:
+            logger.warning("Anonymous caller with no call id — rejecting")
+            return "OK"
+        session_key = f"anon:{call_id[:64]}"
+    else:
+        if not PHONE_RE.match(raw_phone):
+            logger.warning("Rejected malformed phone: %r", raw_phone)
+            return "OK"
+        session_key = raw_phone
 
     val_params = [v for k, v in request.query_params.multi_items() if k == "ValName"]
     ValName = (val_params[-1] if val_params else None)
     if ValName is not None:
         ValName = ValName.strip()[:150]
 
-    logger.info("📞 Phone: %s | ValName: %r", ApiPhone, ValName)
+    logger.info("📞 Phone: %s | Session: %s | ValName: %r", raw_phone, session_key, ValName)
 
     try:
-        if await is_rate_limited(ApiPhone):
+        if await is_rate_limited(session_key):
             return make_ivr_read_command("בוצעו יותר מדי פעולות אנא המתן מעט", "1", "1", 5, "digits")
 
-        async with get_phone_lock(ApiPhone):
-            return await _handle_ivr_locked(request, ApiPhone, ValName)
+        async with get_phone_lock(session_key):
+            return await _handle_ivr_locked(request, session_key, ValName, is_anonymous)
     except Exception as e:
-        logger.exception("Unhandled error in IVR handler for phone=%s: %s", ApiPhone, e)
+        logger.exception("Unhandled error in IVR handler for session=%s: %s", session_key, e)
         return _generic_error_command()
 
 
-async def _handle_ivr_locked(request: Request, ApiPhone: str, ValName: Optional[str]) -> str:
-    user_data = await run_db_query("SELECT authorized, access_code FROM users WHERE phone = ?", (ApiPhone,))
-    is_whitelisted = bool(user_data and user_data[0] == 1)
-    stored_access_code = user_data[1] if user_data else DEFAULT_ACCESS_CODE
+async def _handle_ivr_locked(
+    request: Request, ApiPhone: str, ValName: Optional[str], is_anonymous: bool = False
+) -> str:
+    if is_anonymous:
+        # אין ל-caller חסוי זהות יציבה שאפשר לשמור/לאשר לצמיתות — תמיד דורשים
+        # קוד גישה, ולעולם לא כותבים אותו לטבלת users (שם היא לא בעלת משמעות).
+        is_whitelisted = False
+        stored_access_code = DEFAULT_ACCESS_CODE
+    else:
+        user_data = await run_db_query("SELECT authorized, access_code FROM users WHERE phone = ?", (ApiPhone,))
+        is_whitelisted = bool(user_data and user_data[0] == 1)
+        stored_access_code = user_data[1] if user_data else DEFAULT_ACCESS_CODE
 
     state, playlist, index = await _load_or_create_session(ApiPhone, is_whitelisted)
 
@@ -996,11 +1119,12 @@ async def _handle_ivr_locked(request: Request, ApiPhone: str, ValName: Optional[
     # ---------- Auth flow ----------
     if not is_whitelisted and state == State.CHECK_AUTH.value:
         if ValName and ValName == stored_access_code:
-            await run_db_query(
-                "INSERT OR REPLACE INTO users (phone, authorized, access_code) VALUES (?, 1, ?)",
-                (ApiPhone, stored_access_code),
-                commit=True,
-            )
+            if not is_anonymous:
+                await run_db_query(
+                    "INSERT OR REPLACE INTO users (phone, authorized, access_code) VALUES (?, 1, ?)",
+                    (ApiPhone, stored_access_code),
+                    commit=True,
+                )
             state = State.MAIN_MENU.value
             await _save_session(ApiPhone, state, [], 0)
             ValName = None
@@ -1118,6 +1242,18 @@ async def _handle_ivr_locked(request: Request, ApiPhone: str, ValName: Optional[
 # ==========================================
 # ❤️ Health check
 # ==========================================
+@app.get("/debug/search")
+async def debug_search(q: str = Query(...), token: str = Query(None)):
+    """כלי אבחון מהיר: בודק מה מנוע החיפוש בפועל מחזיר בלי לחכות לשיחת טלפון.
+    מנוטרל לגמרי (404) אם IVR_DEBUG_TOKEN לא הוגדר — לא נחשף בטעות בפרודקשן."""
+    if not DEBUG_TOKEN:
+        raise HTTPException(404)
+    if token != DEBUG_TOKEN:
+        raise HTTPException(403, "Invalid token")
+    tracks = await search_youtube_innertube(q)
+    return {"query": q, "count": len(tracks), "tracks": tracks}
+
+
 @app.get("/health")
 async def health():
     db_ok = True
