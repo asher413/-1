@@ -167,6 +167,25 @@ AMOUNT_RE = re.compile(r"^\d{1,6}$")
 # שראינו בלוגים. ניתן לדרוס אם יוטיוב ישנה אותו (מפתח ציבורי, לא סוד).
 INNERTUBE_KEY = os.environ.get("IVR_INNERTUBE_KEY", "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8")
 
+# YouTube Data API v3 — הדרך ה*רשמית* לחפש (לא גירוד), הכי אמינה שיש. מכסה
+# חינמית: 10,000 יחידות/יום, וחיפוש אחד עולה 100 יחידות => כ-100 חיפושים/יום
+# בחינם. בלי מפתח, מדלגים לשכבות הגירוד (InnerTube/Invidious/Piped) כמו קודם.
+# מפתח חינמי: Google Cloud Console → Enable "YouTube Data API v3" → Credentials.
+YOUTUBE_DATA_API_KEY = os.environ.get("YOUTUBE_DATA_API_KEY", "")
+YOUTUBE_DATA_API_ENABLED = bool(YOUTUBE_DATA_API_KEY)
+if not YOUTUBE_DATA_API_ENABLED:
+    logger.info(
+        "YOUTUBE_DATA_API_KEY not set — search will rely entirely on scraping "
+        "(InnerTube/Invidious/Piped), which is inherently less reliable. "
+        "Setting a free Data API v3 key significantly improves search uptime."
+    )
+
+# פרוקסי אופציונלי (למשל Cloudflare Worker) בין השרת ליוטיוב — שימושי אם ה-IP
+# של הפלטפורמה שלכם (Render וכו') חסום/מוגבל ע"י יוטיוב. בלי זה פונים ישירות
+# ל-www.youtube.com. ה-secret נשלח כ-header ולא כחלק מה-URL כדי שלא ידלוף ללוגים.
+YOUTUBE_PROXY_BASE = os.environ.get("IVR_YOUTUBE_PROXY_BASE", "").rstrip("/")
+YOUTUBE_PROXY_SECRET = os.environ.get("IVR_YOUTUBE_PROXY_SECRET", "")
+
 # רשימות שרתי Invidious/Piped ניתנות לעדכון דרך ENV בלי לגעת בקוד — רשימות
 # כאלה "מתות" ומתחלפות כל הזמן, אז חשוב שלא יהיו קשיחות בקוד באופן בלעדי.
 _default_invidious = "https://invidious.projectsegfau.lt,https://yewtu.be,https://invidious.fdn.fr,https://iv.ggtyler.dev"
@@ -475,6 +494,17 @@ async def is_rate_limited(session_key: str) -> bool:
 # ==========================================
 # 🔎 חיפוש — InnerTube + regex fallback + Invidious fallback
 # ==========================================
+def _parse_iso8601_duration(iso: str) -> str:
+    """ממיר משך זמן בפורמט ISO8601 של YouTube ('PT4M13S') לפורמט קריא (4:13)."""
+    m = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", iso or "")
+    if not m:
+        return "00:00"
+    h, mi, se = (int(x) if x else 0 for x in m.groups())
+    if h:
+        return f"{h}:{mi:02d}:{se:02d}"
+    return f"{mi}:{se:02d}"
+
+
 def _dedupe_and_trim(tracks: List[dict], limit: int = MAX_PLAYLIST_SIZE) -> List[dict]:
     seen = set()
     out = []
@@ -552,6 +582,85 @@ def extract_tracks_regex_fallback(raw_text: str) -> List[dict]:
     ids = _VIDEO_ID_SCAN_RE.findall(raw_text or "")
     tracks = [{"id": vid, "title": "שיר ללא שם", "duration": "00:00", "author": "אמן"} for vid in ids]
     return _dedupe_and_trim(tracks)
+
+
+async def search_youtube_data_api(query: str, filter_newest: bool = False) -> List[dict]:
+    """שכבה 0: ה-API הרשמי של יוטיוב. לא גירוד — לא שובר כשיוטיוב משנה HTML/JSON
+    פנימי, ולא נחסם לפי IP. המגבלה היחידה היא מכסה יומית (ר' הערה ב-config)."""
+    if not YOUTUBE_DATA_API_ENABLED:
+        return []
+    assert http_client is not None
+    try:
+        search_resp = await http_client.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params={
+                "part": "snippet",
+                "q": query,
+                "type": "video",
+                "maxResults": min(MAX_PLAYLIST_SIZE, 15),
+                "regionCode": "IL",
+                "relevanceLanguage": "he",
+                "order": "date" if filter_newest else "relevance",
+                "key": YOUTUBE_DATA_API_KEY,
+            },
+            timeout=7.0,
+        )
+        if search_resp.status_code != 200:
+            try:
+                err = search_resp.json().get("error", {})
+                reason = (err.get("errors") or [{}])[0].get("reason", "")
+            except (json.JSONDecodeError, KeyError, IndexError):
+                reason = ""
+            if reason == "quotaExceeded":
+                logger.warning(
+                    "YouTube Data API v3 quota exceeded for today — falling back "
+                    "to scraping tiers until the quota resets (daily, Pacific time)."
+                )
+            else:
+                logger.warning("YouTube Data API v3 search failed: %s %s", search_resp.status_code, reason)
+            return []
+
+        items = search_resp.json().get("items", [])
+        prelim = []
+        for item in items:
+            vid = (item.get("id") or {}).get("videoId")
+            snippet = item.get("snippet") or {}
+            if not vid:
+                continue
+            prelim.append({
+                "id": vid,
+                "title": snippet.get("title", "שיר ללא שם"),
+                "author": snippet.get("channelTitle", "אמן"),
+                "duration": "00:00",
+            })
+        prelim = _dedupe_and_trim(prelim)
+        if not prelim:
+            return []
+
+        # קריאה שנייה (זולה — יחידת quota אחת) כדי לקבל משכי זמן אמיתיים.
+        try:
+            ids_param = ",".join(t["id"] for t in prelim)
+            details_resp = await http_client.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={"part": "contentDetails", "id": ids_param, "key": YOUTUBE_DATA_API_KEY},
+                timeout=6.0,
+            )
+            if details_resp.status_code == 200:
+                duration_by_id = {
+                    d["id"]: _parse_iso8601_duration((d.get("contentDetails") or {}).get("duration", ""))
+                    for d in details_resp.json().get("items", [])
+                }
+                for t in prelim:
+                    t["duration"] = duration_by_id.get(t["id"], "00:00")
+        except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+            logger.warning("YouTube Data API duration lookup failed (non-fatal): %s", e)
+
+        logger.info("✅ YouTube Data API v3 success: %d tracks", len(prelim))
+        return prelim
+
+    except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+        logger.warning("YouTube Data API v3 request failed: %s", e)
+        return []
 
 
 async def search_invidious_fallback(query: str) -> List[dict]:
@@ -634,7 +743,82 @@ async def search_piped_fallback(query: str) -> List[dict]:
     return []
 
 
+async def _search_via_innertube_scrape(query: str, filter_newest: bool) -> List[dict]:
+    """שכבת גירוד (לא רשמית) של InnerTube — שכבה 1, רק אם ה-Data API הרשמי
+    לא מוגדר/נכשל. עלולה להישבר כשיוטיוב משנה מבנה/מדיניות אנטי-בוט."""
+    api_base = YOUTUBE_PROXY_BASE or "https://www.youtube.com"
+    url = f"{api_base}/youtubei/v1/search?key={INNERTUBE_KEY}&prettyPrint=false"
+    payload = {
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": "2.20260601.01.00",
+                "hl": "he",
+                "gl": "IL",
+                "platform": "DESKTOP",
+                "clientFormFactor": "UNKNOWN_FORM_FACTOR",
+            }
+        },
+        "query": query,
+    }
+    if filter_newest:
+        payload["params"] = "EgQIARAB"  # מיון לפי תאריך העלאה
+
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": "https://www.youtube.com",
+        "Referer": "https://www.youtube.com/",
+        "X-YouTube-Client-Name": "1",
+        "X-YouTube-Client-Version": "2.20260601.01.00",
+    }
+    if YOUTUBE_PROXY_BASE and YOUTUBE_PROXY_SECRET:
+        headers["X-Proxy-Auth"] = YOUTUBE_PROXY_SECRET
+
+    try:
+        assert http_client is not None
+        resp = await http_client.post(url, json=payload, headers=headers, timeout=7.0)
+        logger.info("InnerTube status: %s for query: %s (via %s)", resp.status_code, query,
+                    "proxy" if YOUTUBE_PROXY_BASE else "direct")
+        if resp.status_code != 200:
+            # לוג אבחון מיידי — בלי זה קשה לדעת *למה* השרת דחה (400/403/...)
+            # מבלי לשחזר את הבעיה שוב. 300 תווים מספיקים כדי לזהות סוג שגיאה.
+            logger.warning("InnerTube non-200 body preview: %s", resp.text[:300].replace("\n", " "))
+            return []
+
+        try:
+            raw_data = resp.json()
+            tracks = extract_tracks_from_innertube(raw_data)
+        except json.JSONDecodeError:
+            tracks = []
+
+        if not tracks:
+            logger.warning("Structured parse got 0 tracks for query=%r — trying regex fallback", query)
+            tracks = extract_tracks_regex_fallback(resp.text)
+
+        if tracks:
+            logger.info("✅ InnerTube parsed successfully: %d tracks", len(tracks))
+            return tracks
+
+        # אבחון: אם גם ה-regex לא מצא כלום, כנראה יוטיוב לא החזירה בכלל
+        # תשובת חיפוש רגילה (למשל דף הסכמה/חסימת IP של דאטהסנטר).
+        logger.warning(
+            "InnerTube returned 200 but 0 tracks (structured+regex) for query=%r. Response looks like: %s",
+            query, resp.text[:200].replace("\n", " "),
+        )
+        return []
+    except (httpx.HTTPError, asyncio.TimeoutError) as e:
+        logger.error("InnerTube request failed: %s", e)
+        return []
+
+
 async def search_youtube_innertube(query: str, filter_newest: bool = False) -> List[dict]:
+    """מנוע החיפוש הראשי — עובר על כל שכבות ההגנה בסדר אמינות יורד:
+    0) YouTube Data API v3 הרשמי (אם מוגדר מפתח) — הכי אמין, לא נשבר.
+    1) גירוד InnerTube (ישיר או דרך פרוקסי) — לא רשמי, יכול להישבר.
+    2) Invidious (כמה instances ציבוריים).
+    3) Piped (כמה instances ציבוריים, סוג תקלה שונה מ-Invidious).
+    4) פלייליסט חירום — כדי שלעולם לא תיתקע שיחה בלי שום שיר.
+    כל שכבה שמצליחה נשמרת בקאש (Redis אם מוגדר, אחרת מקומי) ל-15 דקות."""
     query = (query or "").strip()[:150]
     if not query:
         return get_emergency_playlist()
@@ -647,62 +831,19 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         except json.JSONDecodeError:
             pass
 
-    # הגדרת הכתובת של הפרוקסי שלך
-    proxy_url = "https://shiny-union-ba59.a41337sh.workers.dev"
-    url = f"{proxy_url}/youtubei/v1/search?key={INNERTUBE_KEY}&prettyPrint=false"
-    
-    # שינוי ל-ANDROID כדי לעקוף את החסימה של יוטיוב
-    payload = {
-        "context": {
-            "client": {
-                "clientName": "ANDROID",
-                "clientVersion": "17.20.39",
-                "androidSdkVersion": 31,
-                "hl": "he",
-                "gl": "IL",
-                "clientFormFactor": "SMALL_FORM_FACTOR",
-            }
-        },
-        "query": query,
-    }
-    if filter_newest:
-        payload["params"] = "EgQIARAB"
+    if YOUTUBE_DATA_API_ENABLED:
+        tracks = await search_youtube_data_api(query, filter_newest)
+        if tracks:
+            await cache_set(search_cache, "search", cache_key, json.dumps(tracks, ensure_ascii=False), 900)
+            return tracks
+        logger.info("Data API v3 unavailable/empty → trying InnerTube scrape")
 
-    headers = {
-        "Content-Type": "application/json",
-        "Origin": "https://www.youtube.com",
-        "Referer": "https://www.youtube.com/",
-        "User-Agent": "com.google.android.youtube/17.20.39 (Linux; U; Android 11; il)",
-    }
+    tracks = await _search_via_innertube_scrape(query, filter_newest)
+    if tracks:
+        await cache_set(search_cache, "search", cache_key, json.dumps(tracks, ensure_ascii=False), 900)
+        return tracks
 
-    tracks: List[dict] = []
-    try:
-        assert http_client is not None
-        resp = await http_client.post(url, json=payload, headers=headers, timeout=10.0)
-        logger.info("InnerTube status: %s for query: %s", resp.status_code, query)
-        
-        if resp.status_code == 200:
-            try:
-                raw_data = resp.json()
-                tracks = extract_tracks_from_innertube(raw_data)
-            except json.JSONDecodeError:
-                tracks = []
-
-            if not tracks:
-                logger.warning("Structured parse got 0 tracks — trying regex fallback")
-                tracks = extract_tracks_regex_fallback(resp.text)
-
-            if tracks:
-                logger.info("✅ InnerTube parsed successfully: %d tracks", len(tracks))
-                await cache_set(search_cache, "search", cache_key, json.dumps(tracks, ensure_ascii=False), 900)
-                return tracks
-
-            logger.warning("InnerTube returned 200 but 0 tracks for query=%r.", query)
-    except (httpx.HTTPError, asyncio.TimeoutError) as e:
-        logger.error("InnerTube request failed: %s", e)
-
-    # Fallbacks
-    logger.info("InnerTube parsing failed → trying Invidious fallback")
+    logger.info("InnerTube scrape failed → trying Invidious fallback")
     fallback_tracks = await search_invidious_fallback(query)
     if fallback_tracks:
         await cache_set(search_cache, "search", cache_key, json.dumps(fallback_tracks, ensure_ascii=False), 900)
@@ -1241,13 +1382,31 @@ async def _handle_ivr_locked(
 # ❤️ Health check
 # ==========================================
 @app.get("/debug/search")
-async def debug_search(q: str = Query(...), token: str = Query(None)):
+async def debug_search(q: str = Query(...), token: str = Query(None), verbose: int = Query(0)):
     """כלי אבחון מהיר: בודק מה מנוע החיפוש בפועל מחזיר בלי לחכות לשיחת טלפון.
-    מנוטרל לגמרי (404) אם IVR_DEBUG_TOKEN לא הוגדר — לא נחשף בטעות בפרודקשן."""
+    מנוטרל לגמרי (404) אם IVR_DEBUG_TOKEN לא הוגדר — לא נחשף בטעות בפרודקשן.
+    verbose=1 בודק כל שכבה בנפרד (מועיל לאבחן איזו שכבה בדיוק נכשלת),
+    אבל עלול לצרוך quota של Data API — להשתמש בזהירות."""
     if not DEBUG_TOKEN:
         raise HTTPException(404)
     if token != DEBUG_TOKEN:
         raise HTTPException(403, "Invalid token")
+
+    if verbose:
+        result = {}
+        if YOUTUBE_DATA_API_ENABLED:
+            t = await search_youtube_data_api(q)
+            result["data_api_v3"] = {"count": len(t), "sample": t[:2]}
+        else:
+            result["data_api_v3"] = "disabled (no YOUTUBE_DATA_API_KEY)"
+        t = await _search_via_innertube_scrape(q, False)
+        result["innertube_scrape"] = {"count": len(t), "sample": t[:2]}
+        t = await search_invidious_fallback(q)
+        result["invidious"] = {"count": len(t), "sample": t[:2]}
+        t = await search_piped_fallback(q)
+        result["piped"] = {"count": len(t), "sample": t[:2]}
+        return result
+
     tracks = await search_youtube_innertube(q)
     return {"query": q, "count": len(tracks), "tracks": tracks}
 
@@ -1265,5 +1424,7 @@ async def health():
         "clearing_enabled": CLEARING_ENABLED,
         "redis_enabled": _redis is not None,
         "whitelist_count": len(DEFAULT_WHITELIST),
+        "youtube_proxy_configured": bool(YOUTUBE_PROXY_BASE),
+        "youtube_data_api_enabled": YOUTUBE_DATA_API_ENABLED,
         "time": utcnow().isoformat(),
     }
