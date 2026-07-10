@@ -789,6 +789,7 @@ async def _search_via_innertube_scrape(query: str, filter_newest: bool) -> List[
             raw_data = resp.json()
             tracks = extract_tracks_from_innertube(raw_data)
         except json.JSONDecodeError:
+            raw_data = None
             tracks = []
 
         if not tracks:
@@ -799,12 +800,24 @@ async def _search_via_innertube_scrape(query: str, filter_newest: bool) -> List[
             logger.info("✅ InnerTube parsed successfully: %d tracks", len(tracks))
             return tracks
 
-        # אבחון: אם גם ה-regex לא מצא כלום, כנראה יוטיוב לא החזירה בכלל
-        # תשובת חיפוש רגילה (למשל דף הסכמה/חסימת IP של דאטהסנטר).
-        logger.warning(
-            "InnerTube returned 200 but 0 tracks (structured+regex) for query=%r. Response looks like: %s",
-            query, resp.text[:200].replace("\n", " "),
-        )
+        # אבחון מורחב: 200 תווים ראשונים כמעט תמיד זה רק "responseContext"/
+        # "visitorData" — לא אינפורמטיבי. מה שכן אינפורמטיבי: אילו מפתחות
+        # top-level קיימים (למשל absence של "contents" = כנראה נחסמנו/קיבלנו
+        # תשובת "עזרה" ולא תוצאות אמיתיות), ו-estimatedResults אם קיים.
+        if raw_data is not None and isinstance(raw_data, dict):
+            top_keys = list(raw_data.keys())
+            estimated = raw_data.get("estimatedResults")
+            logger.warning(
+                "InnerTube returned 200 but 0 tracks for query=%r. top_level_keys=%s estimatedResults=%s. "
+                "אם 'contents' לא ברשימה — כנראה תשובת bot-block/consent ולא תוצאות אמיתיות; "
+                "פתרון קבוע לכך הוא YOUTUBE_DATA_API_KEY (שכבה 0 הרשמית) ולא עוד תיקון בגירוד.",
+                query, top_keys, estimated,
+            )
+        else:
+            logger.warning(
+                "InnerTube returned 200 but non-JSON/undecodable body for query=%r. Preview: %s",
+                query, resp.text[:300].replace("\n", " "),
+            )
         return []
     except (httpx.HTTPError, asyncio.TimeoutError) as e:
         logger.error("InnerTube request failed: %s", e)
@@ -855,7 +868,12 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         await cache_set(search_cache, "search", cache_key, json.dumps(fallback_tracks, ensure_ascii=False), 900)
         return fallback_tracks
 
-    logger.warning("All search backends failed → Emergency playlist")
+    logger.error(
+        "All search backends failed (query=%r) → serving Emergency playlist. "
+        "אם YOUTUBE_DATA_API_KEY לא מוגדר — זו כנראה הסיבה המרכזית לכשל; "
+        "כל שאר השכבות הן גירוד לא-רשמי שחשוף לחסימות בכל רגע.",
+        query,
+    )
     return get_emergency_playlist()
 
 
