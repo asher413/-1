@@ -927,8 +927,17 @@ async def _resolve_candidate(candidate: str) -> Optional[str]:
 
 
 @app.get("/stream/{video_id}.mp3")
-async def proxy_mp3_stream(video_id: str):
+async def proxy_mp3_stream(video_id: str, request: Request):
+    # לוג בולט ובלתי-ניתן-לפספוס: אם השורה הזו לעולם לא מופיעה בלוג אחרי
+    # שפקודת "read=.../stream/..." הוחזרה למרכזיה, זה מוכיח באופן חד-משמעי
+    # שהמרכזיה (ימות המשיח) בכלל לא ניסתה לפנות לכתובת — כלומר הבעיה היא
+    # בהגדרות הפלטפורמה הטלפונית (חובה לאפשר ניגון קובץ מכתובת אינטרנט
+    # בהגדרות השלוחה), ולא באג בקוד הזה.
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    logger.info("🔊 /stream request RECEIVED for video_id=%s from %s", video_id, client_ip)
+
     if not VIDEO_ID_RE.match(video_id):
+        logger.warning("🔊 /stream rejected: invalid video_id=%r", video_id)
         raise HTTPException(400, "Invalid video ID")
 
     assert http_client is not None
@@ -957,17 +966,23 @@ async def proxy_mp3_stream(video_id: str):
             continue
 
         await cache_set(stream_url_cache, "stream", video_id, target_url, 600)
+        logger.info("🔊 /stream SUCCESS: serving %s via %s", video_id, candidate.split("::")[0])
+
+        byte_counter = {"n": 0}
 
         async def chunk_generator(response: httpx.Response):
             try:
                 async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+                    byte_counter["n"] += len(chunk)
                     yield chunk
             except (httpx.HTTPError, asyncio.TimeoutError) as e:
                 # לא ניתן "לתקן" סטרים שכבר החל להישלח ללקוח (headers כבר נשלחו) —
                 # מה שאפשר זה לוודא ניקוי משאבים נקי ולתעד לצורך מעקב/דשבורד.
-                logger.error("Streaming error mid-stream for %s: %s", video_id, e)
+                logger.error("Streaming error mid-stream for %s after %d bytes: %s",
+                             video_id, byte_counter["n"], e)
             finally:
                 await response.aclose()
+                logger.info("🔊 /stream ENDED for %s, total bytes sent: %d", video_id, byte_counter["n"])
 
         return StreamingResponse(chunk_generator(resp), media_type="audio/mpeg")
 
