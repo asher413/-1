@@ -38,7 +38,7 @@ from typing import Optional, List, Tuple
 
 import httpx
 from fastapi import FastAPI, Query, Request, HTTPException
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from cachetools import TTLCache
 
@@ -122,6 +122,15 @@ SESSION_TTL_HOURS = int(os.environ.get("IVR_SESSION_TTL_HOURS", "4"))
 MAX_PLAYLIST_SIZE = int(os.environ.get("IVR_MAX_PLAYLIST_SIZE", "15"))
 SEARCH_RECURSION_DEPTH_LIMIT = 40
 DB_READ_POOL_SIZE = max(1, int(os.environ.get("IVR_DB_READ_POOL_SIZE", "8")))
+
+# הזרמת שמע: ברירת המחדל היא "buffered" — מורידים את כל קובץ ה-mp3 לזיכרון
+# ואז שולחים תשובה רגילה (לא chunked) עם Content-Length מדויק. הרבה מערכות
+# IVR/טלפוניה ישנות (כולל כאלה שמצפות לדעת מראש את גודל הקובץ) לא מפעילות
+# בכלל נגן שמע כשהתשובה מגיעה ב-chunked transfer encoding בלי Content-Length —
+# וזה בדיוק התסמין שראינו: /stream אף פעם לא נקרא בכלל אחרי שהפקודה הוחזרה.
+# STREAM_MODE=passthrough מחזיר לסגנון הישן (הזרמה live, בלי buffer) אם תרצו.
+STREAM_MODE = os.environ.get("IVR_STREAM_MODE", "buffered").lower()
+MAX_STREAM_BYTES = int(os.environ.get("IVR_MAX_STREAM_BYTES", str(30 * 1024 * 1024)))  # 30MB ~ מספיק לשיר ארוך מאוד
 
 # מספרים "חסויים" ששולחות מרכזיות שונות כשהמתקשר חסם הצגת מספר.
 ANONYMOUS_PHONE_VALUES = {"0", "", "anonymous", "unknown", "withheld", "unavailable"}
@@ -926,15 +935,34 @@ async def _resolve_candidate(candidate: str) -> Optional[str]:
     return None
 
 
-@app.get("/stream/{video_id}.mp3")
+def _parse_range_header(range_header: Optional[str], total_len: int) -> Optional[Tuple[int, int]]:
+    """מפרש 'Range: bytes=START-END' בסיסי. מחזיר (start, end) כולל, או None אם
+    אין/לא תקין (ואז שולחים את הקובץ המלא — זה תמיד תקין, גם אם הלקוח ביקש range)."""
+    if not range_header or not range_header.startswith("bytes="):
+        return None
+    try:
+        spec = range_header.split("=", 1)[1].split(",")[0].strip()
+        start_s, _, end_s = spec.partition("-")
+        start = int(start_s) if start_s else 0
+        end = int(end_s) if end_s else total_len - 1
+        start = max(0, start)
+        end = min(total_len - 1, end)
+        if start > end or start >= total_len:
+            return None
+        return start, end
+    except (ValueError, IndexError):
+        return None
+
+
+@app.api_route("/stream/{video_id}.mp3", methods=["GET", "HEAD"])
 async def proxy_mp3_stream(video_id: str, request: Request):
     # לוג בולט ובלתי-ניתן-לפספוס: אם השורה הזו לעולם לא מופיעה בלוג אחרי
     # שפקודת "read=.../stream/..." הוחזרה למרכזיה, זה מוכיח באופן חד-משמעי
-    # שהמרכזיה (ימות המשיח) בכלל לא ניסתה לפנות לכתובת — כלומר הבעיה היא
-    # בהגדרות הפלטפורמה הטלפונית (חובה לאפשר ניגון קובץ מכתובת אינטרנט
-    # בהגדרות השלוחה), ולא באג בקוד הזה.
+    # שהמרכזיה בכלל לא ניסתה לפנות לכתובת — כלומר הבעיה היא בהגדרות הפלטפורמה
+    # הטלפונית (חובה לאפשר ניגון קובץ מכתובת אינטרנט בהגדרות השלוחה/מס' מסלול),
+    # ולא באג בקוד הזה.
     client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
-    logger.info("🔊 /stream request RECEIVED for video_id=%s from %s", video_id, client_ip)
+    logger.info("🔊 /stream request RECEIVED (%s) for video_id=%s from %s", request.method, video_id, client_ip)
 
     if not VIDEO_ID_RE.match(video_id):
         logger.warning("🔊 /stream rejected: invalid video_id=%r", video_id)
@@ -948,46 +976,118 @@ async def proxy_mp3_stream(video_id: str, request: Request):
         target_url = await _resolve_candidate(candidate)
         if not target_url or not target_url.startswith("https://"):
             continue
-        try:
-            req = http_client.build_request(
-                "GET", target_url,
-                # read=None: זו הזרמת אודיו ארוכת-טווח שהמרכזיה עשויה "להשהות" בפועל
-                # (buffer איטי מצידה) — טיימאאוט קריאה קצוב היה מנתק שירים תקינים
-                # באמצע. connect/write נשארים קצובים כדי לא להיתקע על מקור מת.
-                timeout=httpx.Timeout(connect=5.0, read=None, write=10.0, pool=5.0),
-            )
-            resp = await http_client.send(req, stream=True)
-        except (httpx.HTTPError, asyncio.TimeoutError) as e:
-            logger.warning("Stream preflight failed for %s: %s", candidate[:40], e)
-            continue
 
-        if resp.status_code != 200:
-            await resp.aclose()
-            continue
-
-        await cache_set(stream_url_cache, "stream", video_id, target_url, 600)
-        logger.info("🔊 /stream SUCCESS: serving %s via %s", video_id, candidate.split("::")[0])
-
-        byte_counter = {"n": 0}
-
-        async def chunk_generator(response: httpx.Response):
-            try:
-                async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
-                    byte_counter["n"] += len(chunk)
-                    yield chunk
-            except (httpx.HTTPError, asyncio.TimeoutError) as e:
-                # לא ניתן "לתקן" סטרים שכבר החל להישלח ללקוח (headers כבר נשלחו) —
-                # מה שאפשר זה לוודא ניקוי משאבים נקי ולתעד לצורך מעקב/דשבורד.
-                logger.error("Streaming error mid-stream for %s after %d bytes: %s",
-                             video_id, byte_counter["n"], e)
-            finally:
-                await response.aclose()
-                logger.info("🔊 /stream ENDED for %s, total bytes sent: %d", video_id, byte_counter["n"])
-
-        return StreamingResponse(chunk_generator(resp), media_type="audio/mpeg")
+        if STREAM_MODE == "passthrough":
+            result = await _try_passthrough_stream(candidate, target_url, video_id)
+        else:
+            result = await _try_buffered_stream(candidate, target_url, video_id, request)
+        if result is not None:
+            return result
 
     logger.error("All stream sources exhausted for video_id=%s", video_id)
     raise HTTPException(502, "No available audio source for this track")
+
+
+async def _try_buffered_stream(candidate: str, target_url: str, video_id: str, request: Request):
+    """מוריד את הקובץ המלא לזיכרון ומחזיר תשובה עם Content-Length מדויק —
+    ברירת המחדל, כי זו הדרך הכי תואמת למגוון הרחב ביותר של פלטפורמות IVR."""
+    assert http_client is not None
+    try:
+        resp = await http_client.get(
+            target_url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+            follow_redirects=True,
+        )
+    except (httpx.HTTPError, asyncio.TimeoutError) as e:
+        logger.warning("Buffered fetch failed for %s: %s", candidate[:40], e)
+        return None
+
+    if resp.status_code != 200:
+        return None
+
+    body = resp.content
+    if len(body) == 0:
+        logger.warning("Source %s returned 0 bytes for %s — trying next source", candidate[:40], video_id)
+        return None
+    if len(body) > MAX_STREAM_BYTES:
+        logger.warning(
+            "Track %s exceeds IVR_MAX_STREAM_BYTES (%d > %d) — skipping this source",
+            video_id, len(body), MAX_STREAM_BYTES,
+        )
+        return None
+
+    await cache_set(stream_url_cache, "stream", video_id, target_url, 600)
+    total_len = len(body)
+
+    base_headers = {
+        "Content-Type": "audio/mpeg",
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store",
+    }
+
+    range_header = request.headers.get("range")
+    parsed_range = _parse_range_header(range_header, total_len)
+
+    if request.method == "HEAD":
+        headers = {**base_headers, "Content-Length": str(total_len)}
+        logger.info("🔊 /stream HEAD served for %s: %d bytes total", video_id, total_len)
+        return Response(status_code=200, headers=headers)
+
+    if parsed_range is not None:
+        start, end = parsed_range
+        chunk = body[start:end + 1]
+        headers = {
+            **base_headers,
+            "Content-Length": str(len(chunk)),
+            "Content-Range": f"bytes {start}-{end}/{total_len}",
+        }
+        logger.info("🔊 /stream SUCCESS (206 partial %d-%d/%d): serving %s via %s",
+                    start, end, total_len, video_id, candidate.split("::")[0])
+        return Response(content=chunk, status_code=206, media_type="audio/mpeg", headers=headers)
+
+    headers = {**base_headers, "Content-Length": str(total_len)}
+    logger.info("🔊 /stream SUCCESS (200, %d bytes buffered): serving %s via %s",
+                total_len, video_id, candidate.split("::")[0])
+    return Response(content=body, media_type="audio/mpeg", headers=headers)
+
+
+async def _try_passthrough_stream(candidate: str, target_url: str, video_id: str):
+    """הסגנון הישן: הזרמה live בלי buffer מלא — פחות תואם לפלטפורמות IVR
+    ישנות (אין Content-Length), אבל צורך פחות זיכרון וזמן-עד-תגובה-ראשונה
+    קצר יותר. זמין דרך IVR_STREAM_MODE=passthrough למי שיודע שהמערכת שלו תומכת."""
+    assert http_client is not None
+    try:
+        req = http_client.build_request(
+            "GET", target_url,
+            timeout=httpx.Timeout(connect=5.0, read=None, write=10.0, pool=5.0),
+        )
+        resp = await http_client.send(req, stream=True)
+    except (httpx.HTTPError, asyncio.TimeoutError) as e:
+        logger.warning("Passthrough stream failed for %s: %s", candidate[:40], e)
+        return None
+
+    if resp.status_code != 200:
+        await resp.aclose()
+        return None
+
+    await cache_set(stream_url_cache, "stream", video_id, target_url, 600)
+    logger.info("🔊 /stream SUCCESS (passthrough): serving %s via %s", video_id, candidate.split("::")[0])
+
+    byte_counter = {"n": 0}
+
+    async def chunk_generator(response: httpx.Response):
+        try:
+            async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+                byte_counter["n"] += len(chunk)
+                yield chunk
+        except (httpx.HTTPError, asyncio.TimeoutError) as e:
+            logger.error("Streaming error mid-stream for %s after %d bytes: %s", video_id, byte_counter["n"], e)
+        finally:
+            await response.aclose()
+            logger.info("🔊 /stream ENDED for %s, total bytes sent: %d", video_id, byte_counter["n"])
+
+    return StreamingResponse(chunk_generator(resp), media_type="audio/mpeg")
 
 
 # ==========================================
@@ -1104,24 +1204,31 @@ def make_ivr_read_command(text: str, min_dig: str, max_dig: str, sec: int, mode:
     return f"read=t-{clean}=ValName,no,{max_dig},{min_dig},{sec},{mode.lower()},no"
 
 
-def get_final_play_command(video_id: str, request: Request) -> str:
-    # כתובת השרת הקבועה שלך כדי למנוע טעויות 
-    base = "https://1-y9u0.onrender.com"
-    
-    # בניית פקודת קריאה תקינה של ימות המשיח עם קידומת t-
-    # הפקודה אומרת למרכזיה להשמיע את קובץ הרשת ולהמתין להקשה 
-    return f"read=t-{base}/stream/{video_id}.mp3=ValName,no,1,1,10,No,Yes,No"
+def get_final_play_command(video_id: str, request: Request) -> Optional[str]:
+    if PUBLIC_BASE_URL:
+        base = PUBLIC_BASE_URL
+    else:
+        raw_host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+        # מאחורי כמה פרוקסים בשרשרת (למשל Cloudflare + Render) הכותרת עלולה
+        # להכיל כמה ערכים מופרדים בפסיק ("host1, host2") — הראשון הוא המקורי.
+        host = raw_host.split(",")[0].strip().split(":")[0].lower()
+        if TRUSTED_HOSTS and host not in TRUSTED_HOSTS:
+            logger.error("Rejected untrusted Host header for play command: %r", host)
+            return None
+        protocol = request.headers.get("x-forwarded-proto") or ("http" if "localhost" in host else "https")
+        port = ":10000" if "localhost" in host else ""
+        base = f"{protocol}://{host}{port}"
+    return PLAY_COMMAND_TEMPLATE.format(base=base, video_id=video_id)
+
 
 def _generic_error_command() -> str:
     return make_ivr_read_command("משהו השתבש אנא נסו שוב מאוחר יותר", "1", "1", 5, "digits")
 
+
 def _play_command_or_error(video_id: str, request: Request) -> str:
     cmd = get_final_play_command(video_id, request)
-    
-    # הדפסה ללוג כדי שנראה בדיוק מה נשלח למרכזיה!
-    logger.info(f"🚀 SENDING TO YEMOT: {cmd}")
-    
     return cmd if cmd is not None else _generic_error_command()
+
 
 # ==========================================
 # 🧹 Background cleanup + watchdog
@@ -1253,13 +1360,18 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
 
     try:
         if await is_rate_limited(session_key):
-            return make_ivr_read_command("בוצעו יותר מדי פעולות אנא המתן מעט", "1", "1", 5, "digits")
-
-        async with get_phone_lock(session_key):
-            return await _handle_ivr_locked(request, session_key, ValName, is_anonymous)
+            result = make_ivr_read_command("בוצעו יותר מדי פעולות אנא המתן מעט", "1", "1", 5, "digits")
+        else:
+            async with get_phone_lock(session_key):
+                result = await _handle_ivr_locked(request, session_key, ValName, is_anonymous)
     except Exception as e:
         logger.exception("Unhandled error in IVR handler for session=%s: %s", session_key, e)
-        return _generic_error_command()
+        result = _generic_error_command()
+
+    # לוג מלא של הפקודה שמוחזרת למרכזיה — כך אפשר לראות בדיוק אילו תווים
+    # קיבלה ימות המשיח, ולוודא שהפורמט תואם למה שאתם מריצים ידנית בבדיקות.
+    logger.info("📤 Returning to IVR (session=%s): %s", session_key, result)
+    return result
 
 
 async def _handle_ivr_locked(
@@ -1436,10 +1548,6 @@ async def debug_search(q: str = Query(...), token: str = Query(None), verbose: i
     tracks = await search_youtube_innertube(q)
     return {"query": q, "count": len(tracks), "tracks": tracks}
 
-@app.get("/")
-@app.head("/")
-async def root():
-    return {"status": "ok"}
 
 @app.get("/health")
 async def health():
