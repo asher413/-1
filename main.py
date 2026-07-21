@@ -108,13 +108,23 @@ if not PUBLIC_BASE_URL:
         "מומלץ מאוד להגדיר IVR_PUBLIC_BASE_URL (וגם IVR_REQUIRE_PUBLIC_BASE_URL=true) בפרודקשן."
     )
 
-# תבנית פקודת ה-IVR להפעלת שיר. ההנחה: המרכזיה מבצעת HTTP GET לכתובת שמוחזרת
-# בתוך פקודת read=<url>=... (הקראת קובץ mp3 מרוחק). אם בלוגים אין בקשות ל-
-# /stream/... אחרי שהפקודה חוזרת, סימן שהמרכזיה שלכם דורשת פורמט אחר —
-# אפשר לשנות רק דרך IVR_PLAY_COMMAND_TEMPLATE בלי לגעת בקוד.
+# תבנית פקודת ה-IVR להפעלת שיר בשיטה הישנה (URL חיצוני) — משמשת רק כ-fallback
+# אם YEMOT_ENABLED=False או אם העלאה לימות נכשלה, למקרה שאתם על פלטפורמה
+# אחרת שכן תומכת ב-URL חיצוני. אם בלוגים אין בקשות ל-/stream/... אחרי שהפקודה
+# חוזרת, זה בגלל שימות המשיח לא תומכת בשיטה הזו כלל (מאומת מול הפורום שלהם) —
+# הפתרון הוא YEMOT_SYSTEM_NUMBER+YEMOT_PASSWORD, לא שינוי בתבנית הזו.
 PLAY_COMMAND_TEMPLATE = os.environ.get(
     "IVR_PLAY_COMMAND_TEMPLATE",
     "read={base}/stream/{video_id}.mp3=ValName,no,1,0,2,digits,no",
+)
+
+# תבנית פקודת ניגון עבור קובץ שכבר הועלה לימות המשיח (נתיב פנימי, לא URL).
+# זו ה"השערה הכי סבירה" לפי תיעוד/דוגמאות קוד מהפורום הרשמי — לא אושרה
+# ב-100% ודאות כי אין תיעוד רשמי חד-משמעי לתחביר הניגון בדיוק (רק להעלאה).
+# מומלץ לבדוק פעם אחת ידנית ולהתאים דרך IVR_YEMOT_PLAY_TEMPLATE אם צריך.
+YEMOT_PLAY_TEMPLATE = os.environ.get(
+    "IVR_YEMOT_PLAY_TEMPLATE",
+    "read={yemot_path}=ValName,no,1,0,2,digits,no",
 )
 
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("IVR_RATE_LIMIT_PER_MINUTE", "20"))
@@ -150,6 +160,25 @@ if not CLEARING_ENABLED:
     logger.info(
         "Payment clearing not configured (CLEARING_API_URL/CLEARING_API_KEY missing) — "
         "donation menu option will be disabled."
+    )
+
+# --- ימות המשיח: העלאת קובץ מוקדמת (upload-first) --------------------------
+# אושר במפורש בפורום המפתחים הרשמי של ימות המשיח: ניגון ישירות מ-URL חיצוני
+# *אינו נתמך בכלל* — "השמעה בלי להעלות לא אפשרית". חובה להעלות את הקובץ
+# למערכת ימות עם UploadFile ואז לנגן אותו לפי נתיב פנימי. זו הסיבה המדויקת
+# ש-/stream/ מעולם לא נקרא בלוגים שלכם — לא היה שום באג בקוד, הפרוטוקול הזה
+# פשוט לא קיים אצל ימות. בלי YEMOT_SYSTEM_NUMBER+YEMOT_PASSWORD, המערכת
+# ממשיכה לנסות את שיטת ה-URL הישנה (למקרה שאתם על פלטפורמה אחרת בעתיד).
+YEMOT_SYSTEM_NUMBER = os.environ.get("YEMOT_SYSTEM_NUMBER", "")
+YEMOT_PASSWORD = os.environ.get("YEMOT_PASSWORD", "")
+YEMOT_ENABLED = bool(YEMOT_SYSTEM_NUMBER and YEMOT_PASSWORD)
+YEMOT_API_BASE = os.environ.get("YEMOT_API_BASE", "https://www.call2all.co.il/ym/api")
+YEMOT_UPLOAD_FOLDER = os.environ.get("YEMOT_UPLOAD_FOLDER", "ivr2:/ai_songs").rstrip("/")
+if not YEMOT_ENABLED:
+    logger.info(
+        "YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD not set — playback will use the "
+        "direct-URL method, which Yemot Hamashiach is confirmed NOT to support. "
+        "Set both env vars to enable the upload-first flow that actually works on Yemot."
     )
 
 # Redis אופציונלי לקאש משותף בין כמה instances. בלי REDIS_URL — TTLCache מקומי.
@@ -357,6 +386,13 @@ def init_db() -> None:
                 status TEXT,
                 provider_response TEXT,
                 created_at TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS yemot_uploads (
+                video_id TEXT PRIMARY KEY,
+                yemot_path TEXT NOT NULL,
+                uploaded_at TEXT NOT NULL
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rate_limits_phone_ts ON rate_limits(phone, timestamp)")
@@ -988,6 +1024,40 @@ async def proxy_mp3_stream(video_id: str, request: Request):
     raise HTTPException(502, "No available audio source for this track")
 
 
+async def download_audio_bytes(video_id: str) -> Optional[bytes]:
+    """מוריד את קובץ ה-mp3 המלא לזיכרון, מנסה את כל המקורות לפי סדר עדיפות
+    (כמו /stream), אך מחזיר bytes גולמיים במקום Response — משמש גם את /stream
+    וגם את צינור ההעלאה לימות המשיח, כדי לא לשכפל את לוגיקת ה-fallback."""
+    assert http_client is not None
+    cached_url = await cache_get(stream_url_cache, "stream", video_id)
+    candidates = ([f"invidious::{cached_url}"] if cached_url else []) + await _candidate_stream_urls(video_id)
+
+    for candidate in candidates:
+        target_url = await _resolve_candidate(candidate)
+        if not target_url or not target_url.startswith("https://"):
+            continue
+        try:
+            resp = await http_client.get(
+                target_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+                follow_redirects=True,
+            )
+        except (httpx.HTTPError, asyncio.TimeoutError) as e:
+            logger.warning("Audio download failed for %s via %s: %s", video_id, candidate[:40], e)
+            continue
+        if resp.status_code != 200 or len(resp.content) == 0:
+            continue
+        if len(resp.content) > MAX_STREAM_BYTES:
+            logger.warning("Track %s exceeds IVR_MAX_STREAM_BYTES via %s — trying next source",
+                            video_id, candidate[:40])
+            continue
+        await cache_set(stream_url_cache, "stream", video_id, target_url, 600)
+        return resp.content
+
+    return None
+
+
 async def _try_buffered_stream(candidate: str, target_url: str, video_id: str, request: Request):
     """מוריד את הקובץ המלא לזיכרון ומחזיר תשובה עם Content-Length מדויק —
     ברירת המחדל, כי זו הדרך הכי תואמת למגוון הרחב ביותר של פלטפורמות IVR."""
@@ -1088,6 +1158,125 @@ async def _try_passthrough_stream(candidate: str, target_url: str, video_id: str
             logger.info("🔊 /stream ENDED for %s, total bytes sent: %d", video_id, byte_counter["n"])
 
     return StreamingResponse(chunk_generator(resp), media_type="audio/mpeg")
+
+
+# ==========================================
+# 📤 ימות המשיח: Login + UploadFile (upload-first playback)
+# ==========================================
+# מאומת מול הפורום הרשמי של מפתחי ימות המשיח: ניגון ישירות מ-URL חיצוני *לא
+# נתמך בכלל* על ידי המערכת שלהם — יש להעלות כל קובץ מראש עם UploadFile ואז
+# לנגן אותו לפי נתיב פנימי. זה מסביר באופן מוחלט למה /stream/ מעולם לא נקרא.
+_yemot_token: Optional[str] = None
+_yemot_token_expires_at: Optional[datetime] = None
+_yemot_login_lock = asyncio.Lock()
+
+
+async def _yemot_login(force: bool = False) -> Optional[str]:
+    """מתחבר עם מספר מערכת+סיסמה ומקבל token זמני, עם קאש (ברירת מחדל: מרענן
+    כל 25 דקות ליתר ביטחון, גם אם לא ידוע לנו במדויק כמה זמן token תקף)."""
+    global _yemot_token, _yemot_token_expires_at
+    if not YEMOT_ENABLED:
+        return None
+
+    async with _yemot_login_lock:
+        if not force and _yemot_token and _yemot_token_expires_at and utcnow() < _yemot_token_expires_at:
+            return _yemot_token
+        try:
+            assert http_client is not None
+            resp = await http_client.get(
+                f"{YEMOT_API_BASE}/Login",
+                params={"username": YEMOT_SYSTEM_NUMBER, "password": YEMOT_PASSWORD},
+                timeout=10.0,
+            )
+            data = resp.json()
+            if data.get("responseStatus") != "OK" or not data.get("token"):
+                logger.error("Yemot Login failed: %s", _safe_json_snippet_early(data))
+                return None
+            _yemot_token = data["token"]
+            _yemot_token_expires_at = utcnow() + timedelta(minutes=25)
+            logger.info("Yemot Login OK — token cached for ~25 minutes")
+            return _yemot_token
+        except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+            logger.error("Yemot Login request failed: %s", e)
+            return None
+
+
+def _safe_json_snippet_early(data, limit: int = 500) -> str:
+    """גרסה מוקדמת של _safe_json_snippet (מוגדר שוב במלואו בהמשך הקובץ) —
+    צריך כאן רק כדי לרשום שגיאת Login ללוג בלי לסמוך על סדר הגדרת פונקציות."""
+    try:
+        s = json.dumps(data, ensure_ascii=False)
+    except (TypeError, ValueError):
+        s = str(data)
+    return s[:limit]
+
+
+async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]:
+    """מעלה קובץ mp3 לתיקיית ivr2 הייעודית בימות המשיח. מחזיר את הנתיב הפנימי
+    שנקבע (לשימוש בפקודת הניגון), או None אם ההעלאה נכשלה."""
+    yemot_path = f"{YEMOT_UPLOAD_FOLDER}/{video_id}.mp3"
+
+    async def _do_upload(token: str) -> Optional[httpx.Response]:
+        assert http_client is not None
+        return await http_client.post(
+            f"{YEMOT_API_BASE}/UploadFile",
+            data={"token": token, "path": yemot_path, "convertAudio": "1"},
+            files={"file": (f"{video_id}.mp3", audio_bytes, "audio/mpeg")},
+            timeout=30.0,
+        )
+
+    token = await _yemot_login()
+    if not token:
+        return None
+
+    try:
+        resp = await _do_upload(token)
+        data = resp.json()
+        if data.get("responseStatus") != "OK":
+            # ייתכן שה-token פג — מנסים פעם אחת נוספת עם login מאולץ.
+            logger.warning("Yemot UploadFile first attempt failed (%s) — retrying with fresh login",
+                            _safe_json_snippet_early(data))
+            token = await _yemot_login(force=True)
+            if not token:
+                return None
+            resp = await _do_upload(token)
+            data = resp.json()
+            if data.get("responseStatus") != "OK":
+                logger.error("Yemot UploadFile failed for %s: %s", video_id, _safe_json_snippet_early(data))
+                return None
+
+        logger.info("✅ Yemot UploadFile success for %s → %s", video_id, yemot_path)
+        return yemot_path
+    except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+        logger.error("Yemot UploadFile request failed for %s: %s", video_id, e)
+        return None
+
+
+async def ensure_uploaded_to_yemot(video_id: str) -> Optional[str]:
+    """נקודת הכניסה היחידה שצריך לקרוא לפני ניגון: מחזיר נתיב קובץ בימות
+    (מהקאש/DB אם כבר הועלה בעבר, אחרת מוריד מיוטיוב ומעלה עכשיו)."""
+    if not YEMOT_ENABLED:
+        return None
+
+    cached = await run_db_query("SELECT yemot_path FROM yemot_uploads WHERE video_id = ?", (video_id,))
+    if cached:
+        return cached[0]
+
+    audio_bytes = await download_audio_bytes(video_id)
+    if not audio_bytes:
+        logger.error("Could not download audio for %s — cannot upload to Yemot", video_id)
+        return None
+
+    yemot_path = await _yemot_upload_file(video_id, audio_bytes)
+    if not yemot_path:
+        return None
+
+    await run_db_query(
+        "INSERT OR REPLACE INTO yemot_uploads (video_id, yemot_path, uploaded_at) VALUES (?, ?, ?)",
+        (video_id, yemot_path, utcnow().isoformat()),
+        commit=True,
+    )
+    return yemot_path
 
 
 # ==========================================
@@ -1204,7 +1393,10 @@ def make_ivr_read_command(text: str, min_dig: str, max_dig: str, sec: int, mode:
     return f"read=t-{clean}=ValName,no,{max_dig},{min_dig},{sec},{mode.lower()},no"
 
 
-def get_final_play_command(video_id: str, request: Request) -> Optional[str]:
+def _get_url_based_play_command(video_id: str, request: Request) -> Optional[str]:
+    """השיטה הישנה: מחזירים URL חיצוני שהמרכזיה אמורה להביא בעצמה. מאומת
+    שימות המשיח *לא* תומכת בזה בכלל — זו רק שכבת fallback/תאימות לפלטפורמות
+    אחרות, או למקרה ש-YEMOT_ENABLED=False."""
     if PUBLIC_BASE_URL:
         base = PUBLIC_BASE_URL
     else:
@@ -1225,8 +1417,21 @@ def _generic_error_command() -> str:
     return make_ivr_read_command("משהו השתבש אנא נסו שוב מאוחר יותר", "1", "1", 5, "digits")
 
 
-def _play_command_or_error(video_id: str, request: Request) -> str:
-    cmd = get_final_play_command(video_id, request)
+async def _play_command_or_error(video_id: str, request: Request) -> str:
+    """נקודת הכניסה היחידה לבניית פקודת ניגון: אם ימות מוגדר, מעלים קודם
+    (או משתמשים בהעלאה קיימת) ומנגנים לפי נתיב פנימי — השיטה היחידה שבאמת
+    עובדת בימות המשיח. אם ימות לא מוגדר, או שההעלאה נכשלה, נופלים חזרה
+    לשיטת ה-URL הישנה (במקום פשוט להיכשל)."""
+    if YEMOT_ENABLED:
+        yemot_path = await ensure_uploaded_to_yemot(video_id)
+        if yemot_path:
+            return YEMOT_PLAY_TEMPLATE.format(yemot_path=yemot_path, video_id=video_id)
+        logger.warning(
+            "Yemot upload failed/unavailable for %s — falling back to URL-based play command "
+            "(won't work on real Yemot, but keeps the call from dying silently)", video_id,
+        )
+
+    cmd = _get_url_based_play_command(video_id, request)
     return cmd if cmd is not None else _generic_error_command()
 
 
