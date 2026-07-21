@@ -1443,6 +1443,10 @@ async def debug_search(q: str = Query(...), token: str = Query(None), verbose: i
     tracks = await search_youtube_innertube(q)
     return {"query": q, "count": len(tracks), "tracks": tracks}
 
+@app.get("/")
+@app.head("/")
+async def root():
+    return {"status": "ok"}
 
 @app.get("/health")
 async def health():
