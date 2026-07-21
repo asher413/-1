@@ -1104,21 +1104,14 @@ def make_ivr_read_command(text: str, min_dig: str, max_dig: str, sec: int, mode:
     return f"read=t-{clean}=ValName,no,{max_dig},{min_dig},{sec},{mode.lower()},no"
 
 
-def get_final_play_command(video_id: str, request: Request) -> Optional[str]:
-    if PUBLIC_BASE_URL:
-        base = PUBLIC_BASE_URL
-    else:
-        raw_host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
-        # מאחורי כמה פרוקסים בשרשרת (למשל Cloudflare + Render) הכותרת עלולה
-        # להכיל כמה ערכים מופרדים בפסיק ("host1, host2") — הראשון הוא המקורי.
-        host = raw_host.split(",")[0].strip().split(":")[0].lower()
-        if TRUSTED_HOSTS and host not in TRUSTED_HOSTS:
-            logger.error("Rejected untrusted Host header for play command: %r", host)
-            return None
-        protocol = request.headers.get("x-forwarded-proto") or ("http" if "localhost" in host else "https")
-        port = ":10000" if "localhost" in host else ""
-        base = f"{protocol}://{host}{port}"
-    return PLAY_COMMAND_TEMPLATE.format(base=base, video_id=video_id)
+def get_final_play_command(video_id: str, request: Request) -> str:
+    # שימוש בכתובת הקשיחה של השרת ב-Render כדי למנוע בעיות Headers או Proxy
+    base = "https://1-y9u0.onrender.com"
+    
+    # בניית פקודת השמעה תקינה לימות המשיח:
+    # מקריא את קובץ ה-MP3 החיצוני (חובה להוסיף t- לפני הקישור) 
+    # וממתין להקשת מקש 1 במשך 10 שניות.
+    return f"read=t-{base}/stream/{video_id}.mp3=ValName,no,1,1,10,No,Yes,No"
 
 
 def _generic_error_command() -> str:
