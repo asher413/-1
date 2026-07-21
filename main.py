@@ -1105,23 +1105,23 @@ def make_ivr_read_command(text: str, min_dig: str, max_dig: str, sec: int, mode:
 
 
 def get_final_play_command(video_id: str, request: Request) -> str:
-    # שימוש בכתובת הקשיחה של השרת ב-Render כדי למנוע בעיות Headers או Proxy
+    # כתובת השרת הקבועה שלך כדי למנוע טעויות 
     base = "https://1-y9u0.onrender.com"
     
-    # בניית פקודת השמעה תקינה לימות המשיח:
-    # מקריא את קובץ ה-MP3 החיצוני (חובה להוסיף t- לפני הקישור) 
-    # וממתין להקשת מקש 1 במשך 10 שניות.
+    # בניית פקודת קריאה תקינה של ימות המשיח עם קידומת t-
+    # הפקודה אומרת למרכזיה להשמיע את קובץ הרשת ולהמתין להקשה 
     return f"read=t-{base}/stream/{video_id}.mp3=ValName,no,1,1,10,No,Yes,No"
-
 
 def _generic_error_command() -> str:
     return make_ivr_read_command("משהו השתבש אנא נסו שוב מאוחר יותר", "1", "1", 5, "digits")
 
-
 def _play_command_or_error(video_id: str, request: Request) -> str:
     cmd = get_final_play_command(video_id, request)
+    
+    # הדפסה ללוג כדי שנראה בדיוק מה נשלח למרכזיה!
+    logger.info(f"🚀 SENDING TO YEMOT: {cmd}")
+    
     return cmd if cmd is not None else _generic_error_command()
-
 
 # ==========================================
 # 🧹 Background cleanup + watchdog
