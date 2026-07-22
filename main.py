@@ -174,6 +174,14 @@ YEMOT_PASSWORD = os.environ.get("YEMOT_PASSWORD", "")
 YEMOT_ENABLED = bool(YEMOT_SYSTEM_NUMBER and YEMOT_PASSWORD)
 YEMOT_API_BASE = os.environ.get("YEMOT_API_BASE", "https://www.call2all.co.il/ym/api")
 YEMOT_UPLOAD_FOLDER = os.environ.get("YEMOT_UPLOAD_FOLDER", "ivr2:/ai_songs").rstrip("/")
+
+# מחיקה אוטומטית של השיר מימות המשיח ברגע שהמתקשר יוצא מהקו (hangup) —
+# חוסך מקום אחסון בחשבון ימות שלכם, במחיר איבוד קאש חוצה-משתמשים (אם שני
+# מתקשרים שונים מבקשים את אותו שיר, הוא יורד+יועלה מחדש בכל פעם, במקום
+# פעם אחת ולתמיד). ברירת מחדל: מופעל, לפי בקשה מפורשת. אפשר לכבות עם
+# YEMOT_AUTO_DELETE_AFTER_PLAY=false אם עדיפה לכם החיסכון בזמן על פני החיסכון
+# באחסון.
+YEMOT_AUTO_DELETE_AFTER_PLAY = os.environ.get("YEMOT_AUTO_DELETE_AFTER_PLAY", "true").lower() == "true"
 if not YEMOT_ENABLED:
     logger.info(
         "YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD not set — playback will use the "
@@ -417,6 +425,13 @@ def init_db() -> None:
                 video_id TEXT PRIMARY KEY,
                 yemot_path TEXT NOT NULL,
                 uploaded_at TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS session_uploads (
+                session_key TEXT,
+                video_id TEXT,
+                PRIMARY KEY (session_key, video_id)
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rate_limits_phone_ts ON rate_limits(phone, timestamp)")
@@ -1235,12 +1250,42 @@ def _safe_json_snippet_early(data, limit: int = 500) -> str:
     return s[:limit]
 
 
+_yemot_dirs_ensured: set = set()  # קאש בזיכרון - אילו תיקיות ivr2 כבר נוצרו, כדי לא לקרוא CreateIVR2Dir בכל העלאה
+
+
+async def _yemot_ensure_dir(path: str) -> None:
+    """יוצר תיקיית ivr2 אם היא לא קיימת עדיין. מאומת מול קוד אמיתי בפורום
+    המפתחים של ימות (CreateIVR2Dir?token=...&path=ivr2:...). זו הסיבה
+    הסבירה ביותר ל-IllegalStateException שקיבלתם ב-UploadFile — התיקייה
+    'ai_songs' עדיין לא קיימת בחשבון שלכם."""
+    if path in _yemot_dirs_ensured:
+        return
+    token = await _yemot_login()
+    if not token:
+        return
+    try:
+        assert http_client is not None
+        resp = await http_client.get(
+            f"{YEMOT_API_BASE}/CreateIVR2Dir",
+            params={"token": token, "path": path},
+            timeout=10.0,
+        )
+        data = resp.json()
+        # גם אם היא כבר קיימת, ברוב המקרים זה חוזר OK או שגיאה לא-קריטית —
+        # בכל מקרה מסמנים כ"טופל" כדי לא לנסות שוב ושוב על כל שיר.
+        logger.info("Yemot CreateIVR2Dir(%s): %s", path, _safe_json_snippet_early(data))
+        _yemot_dirs_ensured.add(path)
+    except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+        logger.warning("Yemot CreateIVR2Dir failed for %s (continuing anyway): %s", path, e)
+
+
 async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]:
     """מעלה קובץ mp3 לתיקיית ivr2 הייעודית בימות המשיח. מחזיר את הנתיב הפנימי
     שנקבע (לשימוש בפקודת הניגון), או None אם ההעלאה נכשלה."""
     yemot_path = f"{YEMOT_UPLOAD_FOLDER}/{video_id}.mp3"
+    await _yemot_ensure_dir(YEMOT_UPLOAD_FOLDER)
 
-    async def _do_upload(token: str) -> Optional[httpx.Response]:
+    async def _do_upload(token: str) -> httpx.Response:
         assert http_client is not None
         return await http_client.post(
             f"{YEMOT_API_BASE}/UploadFile",
@@ -1257,9 +1302,12 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
         resp = await _do_upload(token)
         data = resp.json()
         if data.get("responseStatus") != "OK":
-            # ייתכן שה-token פג — מנסים פעם אחת נוספת עם login מאולץ.
-            logger.warning("Yemot UploadFile first attempt failed (%s) — retrying with fresh login",
+            # ייתכן שה-token פג, או (סביר יותר) שהתיקייה עדיין לא הייתה קיימת
+            # בניסיון הראשון — מוודאים שוב שהיא נוצרה ומנסים עם login מאולץ.
+            logger.warning("Yemot UploadFile first attempt failed (%s) — retrying (fresh login + ensure dir)",
                             _safe_json_snippet_early(data))
+            _yemot_dirs_ensured.discard(YEMOT_UPLOAD_FOLDER)
+            await _yemot_ensure_dir(YEMOT_UPLOAD_FOLDER)
             token = await _yemot_login(force=True)
             if not token:
                 return None
@@ -1276,14 +1324,71 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
         return None
 
 
-async def ensure_uploaded_to_yemot(video_id: str) -> Optional[str]:
+async def _yemot_delete_file(path: str) -> bool:
+    """מוחק קובץ מהאחסון של ימות המשיח. מאומת מול הפורום הרשמי:
+    FileAction?token=...&action=delete&what=<path>"""
+    token = await _yemot_login()
+    if not token:
+        return False
+    try:
+        assert http_client is not None
+        resp = await http_client.get(
+            f"{YEMOT_API_BASE}/FileAction",
+            params={"token": token, "action": "delete", "what": path},
+            timeout=10.0,
+        )
+        data = resp.json()
+        ok = data.get("responseStatus") == "OK"
+        if ok:
+            logger.info("🗑️ Yemot file deleted: %s", path)
+        else:
+            logger.warning("Yemot delete failed for %s: %s", path, _safe_json_snippet_early(data))
+        return ok
+    except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+        logger.warning("Yemot FileAction(delete) request failed for %s: %s", path, e)
+        return False
+
+
+async def _track_session_upload(session_key: str, video_id: str) -> None:
+    """רושם ש-video_id הועלה לימות במהלך השיחה של session_key, כדי שנוכל
+    למחוק אותו אוטומטית כשהמתקשר יתנתק (ר' cleanup_session_uploads)."""
+    await run_db_query(
+        "INSERT OR IGNORE INTO session_uploads (session_key, video_id) VALUES (?, ?)",
+        (session_key, video_id), commit=True,
+    )
+
+
+async def cleanup_session_uploads(session_key: str) -> None:
+    """נקרא ב-hangup: מוחק מימות את כל השירים שהועלו במהלך השיחה הזו, ומנקה
+    גם את קאש ה-DB שלנו (yemot_uploads) כדי שהפעם הבאה תוריד ותעלה מחדש —
+    זה בדיוק הטרייד-אוף שביקשתם: פחות אחסון תפוס, יותר קריאות API בכל ניגון."""
+    if not YEMOT_ENABLED or not YEMOT_AUTO_DELETE_AFTER_PLAY:
+        return
+    rows = await run_db_query(
+        "SELECT video_id FROM session_uploads WHERE session_key = ?", (session_key,), fetchall=True
+    )
+    if not rows:
+        return
+    for (video_id,) in rows:
+        cached = await run_db_query("SELECT yemot_path FROM yemot_uploads WHERE video_id = ?", (video_id,))
+        if cached:
+            await _yemot_delete_file(cached[0])
+            await run_db_query("DELETE FROM yemot_uploads WHERE video_id = ?", (video_id,), commit=True)
+    await run_db_query("DELETE FROM session_uploads WHERE session_key = ?", (session_key,), commit=True)
+    logger.info("🧹 Cleaned up %d uploaded track(s) for session=%s after hangup", len(rows), session_key)
+
+
+async def ensure_uploaded_to_yemot(video_id: str, session_key: Optional[str] = None) -> Optional[str]:
     """נקודת הכניסה היחידה שצריך לקרוא לפני ניגון: מחזיר נתיב קובץ בימות
-    (מהקאש/DB אם כבר הועלה בעבר, אחרת מוריד מיוטיוב ומעלה עכשיו)."""
+    (מהקאש/DB אם כבר הועלה בעבר, אחרת מוריד מיוטיוב ומעלה עכשיו). אם
+    session_key סופק ומחיקה-אוטומטית מופעלת, רושמים אותו למחיקה בסוף השיחה."""
     if not YEMOT_ENABLED:
         return None
 
     cached = await run_db_query("SELECT yemot_path FROM yemot_uploads WHERE video_id = ?", (video_id,))
     if cached:
+        if session_key and YEMOT_AUTO_DELETE_AFTER_PLAY:
+            await _track_session_upload(session_key, video_id)
         return cached[0]
 
     audio_bytes = await download_audio_bytes(video_id)
@@ -1300,6 +1405,8 @@ async def ensure_uploaded_to_yemot(video_id: str) -> Optional[str]:
         (video_id, yemot_path, utcnow().isoformat()),
         commit=True,
     )
+    if session_key and YEMOT_AUTO_DELETE_AFTER_PLAY:
+        await _track_session_upload(session_key, video_id)
     return yemot_path
 
 
@@ -1533,13 +1640,14 @@ def _generic_error_command() -> str:
     return make_ivr_read_command("משהו השתבש אנא נסו שוב מאוחר יותר", "1", "1", 5, "digits")
 
 
-async def _play_command_or_error(video_id: str, request: Request) -> str:
+async def _play_command_or_error(video_id: str, request: Request, session_key: Optional[str] = None) -> str:
     """נקודת הכניסה היחידה לבניית פקודת ניגון: אם ימות מוגדר, מעלים קודם
     (או משתמשים בהעלאה קיימת) ומנגנים לפי נתיב פנימי — השיטה היחידה שבאמת
     עובדת בימות המשיח. אם ימות לא מוגדר, או שההעלאה נכשלה, נופלים חזרה
-    לשיטת ה-URL הישנה (במקום פשוט להיכשל)."""
+    לשיטת ה-URL הישנה (במקום פשוט להיכשל). session_key משמש למחיקה אוטומטית
+    של השיר מימות ברגע שהמתקשר הזה מנתק את השיחה."""
     if YEMOT_ENABLED:
-        yemot_path = await ensure_uploaded_to_yemot(video_id)
+        yemot_path = await ensure_uploaded_to_yemot(video_id, session_key)
         if yemot_path:
             return YEMOT_PLAY_TEMPLATE.format(yemot_path=yemot_path, video_id=video_id)
         logger.warning(
@@ -1646,7 +1754,7 @@ async def _load_or_create_session(phone: str, is_whitelisted: bool) -> Tuple[str
 # ==========================================
 @app.get("/youtube", response_class=PlainTextResponse)
 async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str = Query(None)):
-    if hangup == "yes" or not ApiPhone:
+    if not ApiPhone:
         return "OK"
 
     raw_phone = ApiPhone.strip()
@@ -1671,6 +1779,13 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
             logger.warning("Rejected malformed phone: %r", raw_phone)
             return "OK"
         session_key = raw_phone
+
+    if hangup == "yes":
+        # המתקשר יצא מהקו — אם הוגדר מחיקה אוטומטית אחרי השמעה, מוחקים עכשיו
+        # מימות המשיח את כל השירים שהועלו במהלך השיחה הזו (שחרור מקום אחסון).
+        if YEMOT_AUTO_DELETE_AFTER_PLAY:
+            asyncio.create_task(cleanup_session_uploads(session_key))
+        return "OK"
 
     val_params = [v for k, v in request.query_params.multi_items() if k == "ValName"]
     ValName = (val_params[-1] if val_params else None)
@@ -1746,7 +1861,7 @@ async def _handle_ivr_locked(
             if not tracks:
                 tracks = get_emergency_playlist()
             await _save_session(ApiPhone, State.PLAYING_TRACKS.value, tracks, 0)
-            return await _play_command_or_error(tracks[0]["id"], request)
+            return await _play_command_or_error(tracks[0]["id"], request, ApiPhone)
 
         elif ValName == "3":
             favs = await run_db_query(
@@ -1757,7 +1872,7 @@ async def _handle_ivr_locked(
                 return make_ivr_read_command("רשימת המועדפים ריקה", "1", "1", 4, "digits")
             tracks = [{"id": f[0], "title": f[1], "duration": "00:00", "author": ""} for f in favs]
             await _save_session(ApiPhone, State.PLAYING_TRACKS.value, tracks, 0)
-            return await _play_command_or_error(tracks[0]["id"], request)
+            return await _play_command_or_error(tracks[0]["id"], request, ApiPhone)
 
         elif ValName == "9" and CLEARING_ENABLED:
             await _save_session(ApiPhone, State.WAITING_FOR_DONATION_AMOUNT.value, [], 0)
@@ -1795,7 +1910,7 @@ async def _handle_ivr_locked(
             tracks = get_emergency_playlist()
 
         await _save_session(ApiPhone, State.PLAYING_TRACKS.value, tracks, 0)
-        return await _play_command_or_error(tracks[0]["id"], request)
+        return await _play_command_or_error(tracks[0]["id"], request, ApiPhone)
 
     # ---------- DONATION AMOUNT ----------
     elif state == State.WAITING_FOR_DONATION_AMOUNT.value:
@@ -1850,7 +1965,7 @@ async def _handle_ivr_locked(
         # כתיבה אטומית יחידה: state + playlist_json + current_index תמיד יחד,
         # כך ש-DB וה-RAM לעולם לא מתפצלים לגרסאות לא-מסונכרנות.
         await _save_session(ApiPhone, State.PLAYING_TRACKS.value, playlist, index)
-        return await _play_command_or_error(playlist[index]["id"], request)
+        return await _play_command_or_error(playlist[index]["id"], request, ApiPhone)
 
     # מצב לא מוכר — נאפס בבטחה חזרה לתפריט במקום לתקוע את השיחה
     logger.warning("Unknown session state %r for phone=%s — resetting", state, ApiPhone)
@@ -1907,6 +2022,7 @@ async def health():
         "youtube_proxy_configured": bool(YOUTUBE_PROXY_BASE),
         "youtube_data_api_enabled": YOUTUBE_DATA_API_ENABLED,
         "yemot_upload_enabled": YEMOT_ENABLED,
+        "yemot_auto_delete_after_play": YEMOT_AUTO_DELETE_AFTER_PLAY if YEMOT_ENABLED else None,
         "free_stt_enabled": STT_ENABLED,
         "time": utcnow().isoformat(),
     }
