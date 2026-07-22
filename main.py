@@ -180,6 +180,30 @@ if not YEMOT_ENABLED:
         "direct-URL method, which Yemot Hamashiach is confirmed NOT to support. "
         "Set both env vars to enable the upload-first flow that actually works on Yemot."
     )
+YEMOT_RECORDINGS_FOLDER = os.environ.get("YEMOT_RECORDINGS_FOLDER", "ivr2:/ai_recordings").rstrip("/")
+
+# --- זיהוי דיבור בחינם (בלי לשלם לימות המשיח) --------------------------------
+# ימות המשיח גובה כסף על "voice" (זיהוי דיבור מובנה שלהם). האלטרנטיבה: מגדירים
+# את השלוחה במצב "record" (הקלטה גולמית בלבד, ללא זיהוי - ולכן בחינם אצל ימות),
+# מורידים את ההקלטה עם DownloadFile (כבר יש טוקן/Login ממודול ההעלאה למעלה),
+# ומתמללים בעצמנו דרך Groq — יש להם free tier אמיתי ל-Whisper (מהיר, מדויק,
+# בלי צורך במחשוב כבד על השרת שלכם, בניגוד להרצת Whisper מקומי על Render).
+# הרשמה חינמית: https://console.groq.com → API Keys.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+STT_ENABLED = bool(GROQ_API_KEY and YEMOT_ENABLED)  # צריך גם Yemot כדי להוריד את ההקלטה עצמה
+if GROQ_API_KEY and not YEMOT_ENABLED:
+    logger.warning(
+        "GROQ_API_KEY מוגדר אך YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD חסרים — "
+        "בלי זה אי אפשר להוריד את קובץ ההקלטה מימות כדי לתמלל אותו, "
+        "כך שזיהוי הדיבור החינמי מנוטרל וממשיכים עם voice הרגיל (בתשלום)."
+    )
+elif not GROQ_API_KEY:
+    logger.info(
+        "GROQ_API_KEY not set — voice search will use Yemot's built-in (paid) "
+        "recognition. Set GROQ_API_KEY (free tier at console.groq.com) to use "
+        "free transcription instead — no cost per search."
+    )
 
 # Redis אופציונלי לקאש משותף בין כמה instances. בלי REDIS_URL — TTLCache מקומי.
 REDIS_URL = os.environ.get("REDIS_URL", "")
@@ -1279,6 +1303,89 @@ async def ensure_uploaded_to_yemot(video_id: str) -> Optional[str]:
     return yemot_path
 
 
+async def yemot_download_file(path: str) -> Optional[bytes]:
+    """מוריד קובץ (כמו הקלטה גולמית) מהאחסון של ימות המשיח, לפי הנתיב שחוזר
+    ב-ValName אחרי read מסוג record. משתמש באותו token/login של ה-upload."""
+    if not YEMOT_ENABLED:
+        return None
+    token = await _yemot_login()
+    if not token:
+        return None
+    try:
+        assert http_client is not None
+        resp = await http_client.get(
+            f"{YEMOT_API_BASE}/DownloadFile",
+            params={"token": token, "path": path},
+            timeout=15.0,
+        )
+        if resp.status_code != 200 or len(resp.content) == 0:
+            logger.warning("Yemot DownloadFile failed for path=%r: status=%s", path, resp.status_code)
+            return None
+        return resp.content
+    except (httpx.HTTPError, asyncio.TimeoutError) as e:
+        logger.warning("Yemot DownloadFile request failed for path=%r: %s", path, e)
+        return None
+
+
+def _looks_like_yemot_path(value: str) -> bool:
+    """היוריסטיקה לזיהוי אם ValName הוא נתיב קובץ בימות (אחרי הקלטה) ולא
+    טקסט חופשי/ספרות: לפי תחיליות/סיומות טיפוסיות של מערכת הקבצים שלהם."""
+    if not value:
+        return False
+    v = value.strip().lower()
+    return (
+        v.startswith("ivr2:") or v.startswith("/") or
+        v.endswith(".wav") or v.endswith(".mp3") or v.endswith(".ogg")
+    )
+
+
+async def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.wav") -> Optional[str]:
+    """מתמלל הקלטה קולית בעברית דרך Groq (Whisper) — יש להם free tier אמיתי,
+    בלי לשלם על כל חיפוש כמו ב-voice המובנה של ימות. לא נבדק אמפירית מהסביבה
+    הזו (groq.com לא בטווח הרשת של ה-sandbox), אבל עוקב אחרי ה-API המתועד
+    שלהם (תואם-OpenAI: POST /openai/v1/audio/transcriptions, multipart)."""
+    if not GROQ_API_KEY:
+        return None
+    try:
+        assert http_client is not None
+        resp = await http_client.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            data={"model": GROQ_STT_MODEL, "language": "he", "response_format": "json"},
+            files={"file": (filename, audio_bytes, "audio/wav")},
+            timeout=20.0,
+        )
+        if resp.status_code != 200:
+            logger.warning("Groq transcription failed: %s %s", resp.status_code, resp.text[:200])
+            return None
+        text = (resp.json() or {}).get("text", "").strip()
+        return text or None
+    except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+        logger.warning("Groq transcription request failed: %s", e)
+        return None
+
+
+async def resolve_search_query_from_valname(val_name: str) -> Optional[str]:
+    """נקודת הכניסה היחידה לפענוח מה שחזר מהשלוחה של 'אמרו שם שיר':
+    - אם STT_ENABLED והערך נראה כמו נתיב קובץ בימות (מצב record חינמי) —
+      מורידים את ההקלטה ומתמללים בעצמנו דרך Groq.
+    - אחרת (או אם התמלול נכשל) — מניחים שזה כבר טקסט מזוהה (מצב voice
+      המובנה בתשלום של ימות, או פלטפורמה אחרת), ומשתמשים בו כמות שהוא."""
+    if STT_ENABLED and _looks_like_yemot_path(val_name):
+        audio_bytes = await yemot_download_file(val_name.strip())
+        if not audio_bytes:
+            logger.error("Could not download recording from Yemot at path=%r for transcription", val_name)
+            return None
+        text = await transcribe_audio_bytes(audio_bytes)
+        if text:
+            logger.info("🎙️ Free transcription result: %r (from recording %s)", text, val_name)
+        else:
+            logger.warning("Transcription returned empty/failed for recording %s", val_name)
+        return text
+
+    return val_name
+
+
 # ==========================================
 # 💳 סליקת תשלומים (אופציונלי)
 # ==========================================
@@ -1391,6 +1498,15 @@ def make_ivr_read_command(text: str, min_dig: str, max_dig: str, sec: int, mode:
     if mode.lower() == "voice":
         return f"read=t-{clean}=ValName,no,50,1,{sec},voice,no"
     return f"read=t-{clean}=ValName,no,{max_dig},{min_dig},{sec},{mode.lower()},no"
+
+
+def make_ivr_record_command(text: str, max_seconds: int) -> str:
+    """מקליטה גולמית בלי זיהוי דיבור (record) — בחינם אצל ימות המשיח, בניגוד
+    ל-voice (שגובה כסף). לפי אישור מפורש בפורום המפתחים של ימות: כשמסתיימת
+    הקלטה, הנתיב שבו היא נשמרה חוזר ב-ValName בבקשה הבאה, ולא התמלול עצמו —
+    אנחנו מורידים את הקובץ עם DownloadFile ומתמללים בעצמנו (ר' STT_ENABLED)."""
+    clean = clean_text_for_ivr(text)
+    return f"read=t-{clean}=ValName,no,,,{max_seconds},record,no"
 
 
 def _get_url_based_play_command(video_id: str, request: Request) -> Optional[str]:
@@ -1618,6 +1734,11 @@ async def _handle_ivr_locked(
     if state == State.MAIN_MENU.value:
         if ValName == "1":
             await _save_session(ApiPhone, State.WAITING_FOR_SEARCH.value, [], 0)
+            if STT_ENABLED:
+                # מצב הקלטה חינמי (record) — בלי voice בתשלום של ימות. תמלול
+                # עצמי דרך Groq קורה בשלב הבא (WAITING_FOR_SEARCH) לפי הנתיב
+                # שיחזור ב-ValName.
+                return make_ivr_record_command("אנא אמרו את שם השיר לאחר הצליל", max_seconds=10)
             return make_ivr_read_command("אנא אמרו את שם השיר לאחר הצליל", "1", "50", 10, "voice")
 
         elif ValName == "2":
@@ -1625,7 +1746,7 @@ async def _handle_ivr_locked(
             if not tracks:
                 tracks = get_emergency_playlist()
             await _save_session(ApiPhone, State.PLAYING_TRACKS.value, tracks, 0)
-            return _play_command_or_error(tracks[0]["id"], request)
+            return await _play_command_or_error(tracks[0]["id"], request)
 
         elif ValName == "3":
             favs = await run_db_query(
@@ -1636,7 +1757,7 @@ async def _handle_ivr_locked(
                 return make_ivr_read_command("רשימת המועדפים ריקה", "1", "1", 4, "digits")
             tracks = [{"id": f[0], "title": f[1], "duration": "00:00", "author": ""} for f in favs]
             await _save_session(ApiPhone, State.PLAYING_TRACKS.value, tracks, 0)
-            return _play_command_or_error(tracks[0]["id"], request)
+            return await _play_command_or_error(tracks[0]["id"], request)
 
         elif ValName == "9" and CLEARING_ENABLED:
             await _save_session(ApiPhone, State.WAITING_FOR_DONATION_AMOUNT.value, [], 0)
@@ -1651,14 +1772,30 @@ async def _handle_ivr_locked(
     # ---------- SEARCH ----------
     elif state == State.WAITING_FOR_SEARCH.value:
         if not ValName or len(ValName) < 2 or ValName in ("1", "2", "*", "#"):
-            return make_ivr_read_command("לא קלטתי בבירור, אנא אמרו שוב", "1", "50", 10, "voice")
+            retry_cmd = (
+                make_ivr_record_command("לא קלטתי בבירור, אנא אמרו שוב", max_seconds=10)
+                if STT_ENABLED else
+                make_ivr_read_command("לא קלטתי בבירור, אנא אמרו שוב", "1", "50", 10, "voice")
+            )
+            return retry_cmd
 
-        tracks = await search_youtube_innertube(ValName)
+        query = await resolve_search_query_from_valname(ValName)
+        if not query:
+            # התמלול נכשל (למשל לא הצלחנו להוריד/לתמלל את ההקלטה) — לא נתקע
+            # את המתקשר, פשוט מבקשים ניסיון נוסף באותה שיטה.
+            retry_cmd = (
+                make_ivr_record_command("לא הצלחתי להבין, אנא נסו שוב", max_seconds=10)
+                if STT_ENABLED else
+                make_ivr_read_command("לא הצלחתי להבין, אנא נסו שוב", "1", "50", 10, "voice")
+            )
+            return retry_cmd
+
+        tracks = await search_youtube_innertube(query)
         if not tracks:
             tracks = get_emergency_playlist()
 
         await _save_session(ApiPhone, State.PLAYING_TRACKS.value, tracks, 0)
-        return _play_command_or_error(tracks[0]["id"], request)
+        return await _play_command_or_error(tracks[0]["id"], request)
 
     # ---------- DONATION AMOUNT ----------
     elif state == State.WAITING_FOR_DONATION_AMOUNT.value:
@@ -1713,7 +1850,7 @@ async def _handle_ivr_locked(
         # כתיבה אטומית יחידה: state + playlist_json + current_index תמיד יחד,
         # כך ש-DB וה-RAM לעולם לא מתפצלים לגרסאות לא-מסונכרנות.
         await _save_session(ApiPhone, State.PLAYING_TRACKS.value, playlist, index)
-        return _play_command_or_error(playlist[index]["id"], request)
+        return await _play_command_or_error(playlist[index]["id"], request)
 
     # מצב לא מוכר — נאפס בבטחה חזרה לתפריט במקום לתקוע את השיחה
     logger.warning("Unknown session state %r for phone=%s — resetting", state, ApiPhone)
@@ -1769,5 +1906,7 @@ async def health():
         "whitelist_count": len(DEFAULT_WHITELIST),
         "youtube_proxy_configured": bool(YOUTUBE_PROXY_BASE),
         "youtube_data_api_enabled": YOUTUBE_DATA_API_ENABLED,
+        "yemot_upload_enabled": YEMOT_ENABLED,
+        "free_stt_enabled": STT_ENABLED,
         "time": utcnow().isoformat(),
     }
