@@ -51,6 +51,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("IVR_Production_Engine")
 
+# חשוב לאבטחה: httpx מדפיס ברירת מחדל את ה-URL המלא של כל בקשה ברמת INFO —
+# כולל query params. אצל ימות המשיח זה חושף את הסיסמה בטקסט גלוי בלוגים
+# (ראינו את זה בפועל: "Login?username=...&password=..."). מנמיכים ל-WARNING
+# כדי שרק שגיאות אמיתיות של httpx יופיעו, לא כל בקשה עם הסודות שבתוכה.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -173,7 +179,14 @@ YEMOT_SYSTEM_NUMBER = os.environ.get("YEMOT_SYSTEM_NUMBER", "")
 YEMOT_PASSWORD = os.environ.get("YEMOT_PASSWORD", "")
 YEMOT_ENABLED = bool(YEMOT_SYSTEM_NUMBER and YEMOT_PASSWORD)
 YEMOT_API_BASE = os.environ.get("YEMOT_API_BASE", "https://www.call2all.co.il/ym/api")
-YEMOT_UPLOAD_FOLDER = os.environ.get("YEMOT_UPLOAD_FOLDER", "ivr2:/ai_songs").rstrip("/")
+# נתיב ivr2 להעלאת שירים. לפי תיעוד רשמי של ימות: התחביר הנכון הוא
+# ivr2:<תיקייה>/<קובץ> — בלי לוכסן אחרי הנקודתיים! (ivr2:5/000.wav, לא
+# ivr2:/5/000.wav). בנוסף, תיקיות ב-ivr2 הן בפועל שלוחות (extensions) שצריך
+# ליצור פעם אחת ידנית בפאנל הניהול של ימות (לא ניתן ליצור "תיקייה חדשה בשם
+# חופשי" מה-API בלי שלוחה קיימת מתחתיה) — לכן ברירת המחדל כאן היא מספר
+# שלוחה לדוגמה בלבד; יש להחליף ב-YEMOT_UPLOAD_FOLDER למספר שלוחה אמיתי
+# שיצרתם מראש (למשל "90" אם פתחתם שלוחה 90 ל-mp3 של השירים).
+YEMOT_UPLOAD_FOLDER = os.environ.get("YEMOT_UPLOAD_FOLDER", "90").strip().strip("/")
 
 # מחיקה אוטומטית של השיר מימות המשיח ברגע שהמתקשר יוצא מהקו (hangup) —
 # חוסך מקום אחסון בחשבון ימות שלכם, במחיר איבוד קאש חוצה-משתמשים (אם שני
@@ -1222,9 +1235,13 @@ async def _yemot_login(force: bool = False) -> Optional[str]:
             return _yemot_token
         try:
             assert http_client is not None
-            resp = await http_client.get(
+            # POST עם body במקום GET עם query params — Yemot תומכת בשני
+            # השיטות (מתועד רשמית), אבל GET שם את הסיסמה בתוך ה-URL עצמו,
+            # שמודפס במלואו ע"י httpx/Render/כל פרוקסי בדרך. עם POST הסיסמה
+            # נמצאת ב-body ולא מודפסת בשום מקום.
+            resp = await http_client.post(
                 f"{YEMOT_API_BASE}/Login",
-                params={"username": YEMOT_SYSTEM_NUMBER, "password": YEMOT_PASSWORD},
+                data={"username": YEMOT_SYSTEM_NUMBER, "password": YEMOT_PASSWORD},
                 timeout=10.0,
             )
             data = resp.json()
@@ -1265,9 +1282,9 @@ async def _yemot_ensure_dir(path: str) -> None:
         return
     try:
         assert http_client is not None
-        resp = await http_client.get(
+        resp = await http_client.post(
             f"{YEMOT_API_BASE}/CreateIVR2Dir",
-            params={"token": token, "path": path},
+            data={"token": token, "path": path},
             timeout=10.0,
         )
         data = resp.json()
@@ -1332,9 +1349,9 @@ async def _yemot_delete_file(path: str) -> bool:
         return False
     try:
         assert http_client is not None
-        resp = await http_client.get(
+        resp = await http_client.post(
             f"{YEMOT_API_BASE}/FileAction",
-            params={"token": token, "action": "delete", "what": path},
+            data={"token": token, "action": "delete", "what": path},
             timeout=10.0,
         )
         data = resp.json()
@@ -1420,9 +1437,9 @@ async def yemot_download_file(path: str) -> Optional[bytes]:
         return None
     try:
         assert http_client is not None
-        resp = await http_client.get(
+        resp = await http_client.post(
             f"{YEMOT_API_BASE}/DownloadFile",
-            params={"token": token, "path": path},
+            data={"token": token, "path": path},
             timeout=15.0,
         )
         if resp.status_code != 200 or len(resp.content) == 0:
@@ -2004,6 +2021,99 @@ async def debug_search(q: str = Query(...), token: str = Query(None), verbose: i
 
     tracks = await search_youtube_innertube(q)
     return {"query": q, "count": len(tracks), "tracks": tracks}
+
+
+@app.get("/debug/yemot")
+async def debug_yemot(token: str = Query(None)):
+    """כלי אבחון מקיף לימות המשיח: מריץ Login, ואז מנסה כמה וריאציות שונות
+    של פורמט הנתיב על CreateIVR2Dir ו-UploadFile (עם קובץ דמה קטן), ומחזיר
+    את *כל* התגובות הגולמיות מהשרת בבת אחת. המטרה: לגלות באיזה פורמט נתיב
+    ימות המשיח שלכם בפועל מצפה, בלי עוד סבב שלם של שיחת טלפון + דפלוי.
+    מנוטרל לגמרי (404) אם IVR_DEBUG_TOKEN לא הוגדר."""
+    if not DEBUG_TOKEN:
+        raise HTTPException(404)
+    if token != DEBUG_TOKEN:
+        raise HTTPException(403, "Invalid token")
+    if not YEMOT_ENABLED:
+        raise HTTPException(400, "YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD not configured")
+
+    assert http_client is not None
+    report: dict = {}
+
+    yemot_token = await _yemot_login(force=True)
+    report["login"] = {
+        "ok": bool(yemot_token),
+        "token_preview": (yemot_token[:6] + "...") if yemot_token else None,
+    }
+    if not yemot_token:
+        report["conclusion"] = "Login עצמו נכשל — בדקו YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD"
+        return report
+
+    # --- וריאציות פורמט לתיקייה (CreateIVR2Dir), וגם GET וגם POST — כי
+    # "Invalid WS request" יכול להעיד על אי-התאמת method ולא רק פורמט נתיב ---
+    dir_variants = ["ivr2:/ai_songs", "ivr2:ai_songs", "ai_songs", "/ai_songs", "ivr2:/1", "ivr2:1"]
+    report["create_dir_attempts"] = []
+    for variant in dir_variants:
+        for method in ("GET", "POST"):
+            try:
+                if method == "GET":
+                    resp = await http_client.get(
+                        f"{YEMOT_API_BASE}/CreateIVR2Dir",
+                        params={"token": yemot_token, "path": variant},
+                        timeout=10.0,
+                    )
+                else:
+                    resp = await http_client.post(
+                        f"{YEMOT_API_BASE}/CreateIVR2Dir",
+                        data={"token": yemot_token, "path": variant},
+                        timeout=10.0,
+                    )
+                data = resp.json()
+            except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+                data = {"error": str(e)}
+            report["create_dir_attempts"].append({"path_tried": variant, "method": method, "raw_response": data})
+
+    # --- וריאציות פורמט להעלאת קובץ (UploadFile) — קובץ דמה זעיר, לא שיר אמיתי ---
+    dummy_audio = b"\x00" * 200
+    upload_variants = [
+        "ivr2:/ai_songs/_debugtest.mp3",
+        "ivr2:ai_songs/_debugtest.mp3",
+        "ivr2:/_debugtest.mp3",
+        "ivr2:_debugtest.mp3",
+        "ivr2:/1/_debugtest.mp3",
+    ]
+    report["upload_attempts"] = []
+    successful_path = None
+    for variant in upload_variants:
+        try:
+            resp = await http_client.post(
+                f"{YEMOT_API_BASE}/UploadFile",
+                data={"token": yemot_token, "path": variant, "convertAudio": "1"},
+                files={"file": ("_debugtest.mp3", dummy_audio, "audio/mpeg")},
+                timeout=15.0,
+            )
+            data = resp.json()
+        except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+            data = {"error": str(e)}
+        report["upload_attempts"].append({"path_tried": variant, "raw_response": data})
+        if isinstance(data, dict) and data.get("responseStatus") == "OK" and successful_path is None:
+            successful_path = variant
+
+    if successful_path:
+        report["conclusion"] = (
+            f"✅ נמצא פורמט עובד: {successful_path!r} — עדכנו YEMOT_UPLOAD_FOLDER "
+            f"בהתאם (בלי שם הקובץ) והריצו שוב."
+        )
+        # מנקים את קובץ הבדיקה כדי לא להשאיר זבל בחשבון
+        await _yemot_delete_file(successful_path)
+    else:
+        report["conclusion"] = (
+            "❌ אף וריאציה לא הצליחה. אנא שילחו את כל ה-JSON הזה חזרה — "
+            "התגובות הגולמיות מכילות את הרמז המדויק (exceptionMessage/message) "
+            "לכך שימות דוחה, גם אם הוא ריק במקרים מסוימים."
+        )
+
+    return report
 
 
 @app.get("/health")
