@@ -26,6 +26,7 @@ import os
 import re
 import json
 import copy
+import time
 import random
 import secrets
 import sqlite3
@@ -1303,7 +1304,13 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
     """מעלה קובץ mp3 לשלוחת ivr2 הייעודית בימות המשיח. מחזיר את הנתיב הפנימי
     שנקבע, או None אם ההעלאה נכשלה.
 
-    חשוב לגבי תזמון: לפי דיווח אמיתי בפורום המפתחים, אחרי UpdateExtension
+    קריטי: מאומת במפורש בפורום המפתחים — 'שם הקובץ צריך לכלול ספרות בלבד'.
+    video_id של יוטיוב מכיל אותיות (רישיות וקטנות) ומקפים/קווים תחתונים,
+    שנדחים ע"י ימות עם 'path is invalid' (messageCode 110) — זו הסיבה
+    האמיתית לשגיאה שקיבלתם, לא (רק) עניין השלוחה. לכן משתמשים כאן בשם קובץ
+    מספרי בלבד (timestamp במילישניות) ושומרים את המיפוי ל-video_id ב-DB.
+
+    חשוב גם לגבי תזמון: לפי דיווח אמיתי בפורום המפתחים, אחרי UpdateExtension
     לוקח עד כ-2 דקות עד שהשלוחה החדשה 'נתפסת' בפועל אצל ימות. מכיוון שזו
     שיחת טלפון חיה עם timeout אמיתי מצד המרכזיה (לא ידוע לנו בדיוק כמה, אבל
     בטוח לא 2 דקות) — אסור לנו לחכות כל כך הרבה זמן בתוך הבקשה עצמה. לכן:
@@ -1311,7 +1318,8 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
     מפעילים warm-up ברקע (לא חוסם את התשובה למרכזיה) שממשיך לנסות במשך עד
     כ-2 דקות — כך שהשיר הראשון ייפול לשיטת ה-URL הישנה פעם אחת בלבד, אבל
     כל בקשה הבאה (לאותו שיר או לשיר אחר) תעבוד כרגיל ברגע שההפצה תושלם."""
-    yemot_path = f"{YEMOT_UPLOAD_FOLDER}/{video_id}.mp3"
+    numeric_filename = f"{int(time.time() * 1000)}.mp3"  # ספרות בלבד — דרישה מאומתת של ימות
+    yemot_path = f"{YEMOT_UPLOAD_FOLDER}/{numeric_filename}"
     is_new_folder = YEMOT_UPLOAD_FOLDER not in _yemot_dirs_ensured
     await _yemot_ensure_dir(YEMOT_UPLOAD_FOLDER)
 
@@ -1320,7 +1328,7 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
         return await http_client.post(
             f"{YEMOT_API_BASE}/UploadFile",
             data={"token": token, "path": yemot_path, "convertAudio": "1"},
-            files={"file": (f"{video_id}.mp3", audio_bytes, "audio/mpeg")},
+            files={"file": (numeric_filename, audio_bytes, "audio/mpeg")},
             timeout=30.0,
         )
 
@@ -1368,6 +1376,7 @@ async def _yemot_upload_warmup(video_id: str, audio_bytes: bytes, yemot_path: st
     """ריצה ברקע בלבד (לא במסגרת שיחה חיה): ממשיכה לנסות להעלות עם השהיות
     גדלות עד שהשלוחה החדשה מופצת בימות (עד כ-2 דקות לפי דיווחים בפורום),
     ושומרת ל-DB אם וכשמצליחה — כדי שבקשות עתידיות ימצאו אותה בקאש מיד."""
+    numeric_filename = yemot_path.rsplit("/", 1)[-1]  # אותו שם קובץ מספרי שנקבע ב-caller, לא video_id
     for delay in (10, 20, 30, 45):
         await asyncio.sleep(delay)
         token = await _yemot_login()
@@ -1378,7 +1387,7 @@ async def _yemot_upload_warmup(video_id: str, audio_bytes: bytes, yemot_path: st
             resp = await http_client.post(
                 f"{YEMOT_API_BASE}/UploadFile",
                 data={"token": token, "path": yemot_path, "convertAudio": "1"},
-                files={"file": (f"{video_id}.mp3", audio_bytes, "audio/mpeg")},
+                files={"file": (numeric_filename, audio_bytes, "audio/mpeg")},
                 timeout=30.0,
             )
             data = resp.json()
@@ -2158,23 +2167,22 @@ async def debug_yemot(token: str = Query(None), target_ext: str = Query(None)):
         await asyncio.sleep(10)
 
     dummy_audio = b"\x00" * 200
+    debug_filename = f"{int(time.time() * 1000)}.mp3"  # ספרות בלבד — דרישה מאומתת של ימות (ראו הערה למעלה)
     upload_variants = [
-        "ivr2:/ai_songs/_debugtest.mp3",
-        "ivr2:ai_songs/_debugtest.mp3",
-        "ivr2:/_debugtest.mp3",
-        "ivr2:_debugtest.mp3",
-        "ivr2:/1/_debugtest.mp3",
-        "1/_debugtest.mp3",           # בלי תחילית ivr2: בכלל
-        "_debugtest.mp3",             # שם קובץ בלבד, בלי תיקייה
+        f"ivr2:/ai_songs/{debug_filename}",
+        f"ivr2:ai_songs/{debug_filename}",
+        f"ivr2:/{debug_filename}",
+        f"ivr2:{debug_filename}",
+        f"ivr2:/1/{debug_filename}",
+        f"1/{debug_filename}",           # בלי תחילית ivr2: בכלל
+        debug_filename,                   # שם קובץ בלבד, בלי תיקייה
     ]
     if target_ext:
         clean_ext = target_ext.strip().strip("/")
         upload_variants = [
-            f"ivr2:/{clean_ext}/_debugtest.mp3",
-            f"ivr2:{clean_ext}/_debugtest.mp3",
-            f"{clean_ext}/_debugtest.mp3",
-            f"ivr2:/{clean_ext}",
-            f"ivr2:{clean_ext}",
+            f"ivr2:/{clean_ext}/{debug_filename}",
+            f"ivr2:{clean_ext}/{debug_filename}",
+            f"{clean_ext}/{debug_filename}",
         ] + upload_variants
     report["upload_attempts"] = []
     successful_path = None
@@ -2183,7 +2191,7 @@ async def debug_yemot(token: str = Query(None), target_ext: str = Query(None)):
             resp = await http_client.post(
                 f"{YEMOT_API_BASE}/UploadFile",
                 data={"token": yemot_token, "path": variant, "convertAudio": "1"},
-                files={"file": ("_debugtest.mp3", dummy_audio, "audio/mpeg")},
+                files={"file": (debug_filename, dummy_audio, "audio/mpeg")},
                 timeout=15.0,
             )
             data = resp.json()
