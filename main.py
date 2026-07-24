@@ -1267,39 +1267,52 @@ def _safe_json_snippet_early(data, limit: int = 500) -> str:
     return s[:limit]
 
 
-_yemot_dirs_ensured: set = set()  # קאש בזיכרון - אילו תיקיות ivr2 כבר נוצרו, כדי לא לקרוא CreateIVR2Dir בכל העלאה
+_yemot_dirs_ensured: set = set()  # קאש בזיכרון - אילו שלוחות ivr2 כבר נוצרו, כדי לא לקרוא UpdateExtension בכל העלאה
 
 
-async def _yemot_ensure_dir(path: str) -> None:
-    """יוצר תיקיית ivr2 אם היא לא קיימת עדיין. מאומת מול קוד אמיתי בפורום
-    המפתחים של ימות (CreateIVR2Dir?token=...&path=ivr2:...). זו הסיבה
-    הסבירה ביותר ל-IllegalStateException שקיבלתם ב-UploadFile — התיקייה
-    'ai_songs' עדיין לא קיימת בחשבון שלכם."""
+async def _yemot_ensure_dir(path: str) -> bool:
+    """יוצר שלוחת ivr2 אם היא לא קיימת עדיין. מאומת מול המדריך הרשמי
+    למתחילים ב-API של ימות המשיח (לא CreateIVR2Dir — endpoint שגוי/לא פעיל
+    שכשל בעקביות בכל בדיקה; UpdateExtension הוא הפקודה הנכונה ליצירת שלוחה).
+    מחזיר True אם הבקשה עצמה הצליחה (לא בהכרח שהשלוחה כבר זמינה מיד —
+    ר' ההערה על השהיית הפצה ב-_yemot_upload_file)."""
     if path in _yemot_dirs_ensured:
-        return
+        return True
     token = await _yemot_login()
     if not token:
-        return
+        return False
     try:
         assert http_client is not None
         resp = await http_client.post(
-            f"{YEMOT_API_BASE}/CreateIVR2Dir",
+            f"{YEMOT_API_BASE}/UpdateExtension",
             data={"token": token, "path": path},
             timeout=10.0,
         )
         data = resp.json()
-        # גם אם היא כבר קיימת, ברוב המקרים זה חוזר OK או שגיאה לא-קריטית —
-        # בכל מקרה מסמנים כ"טופל" כדי לא לנסות שוב ושוב על כל שיר.
-        logger.info("Yemot CreateIVR2Dir(%s): %s", path, _safe_json_snippet_early(data))
-        _yemot_dirs_ensured.add(path)
+        ok = data.get("responseStatus") == "OK"
+        logger.info("Yemot UpdateExtension(%s): %s", path, _safe_json_snippet_early(data))
+        if ok:
+            _yemot_dirs_ensured.add(path)
+        return ok
     except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
-        logger.warning("Yemot CreateIVR2Dir failed for %s (continuing anyway): %s", path, e)
+        logger.warning("Yemot UpdateExtension failed for %s: %s", path, e)
+        return False
 
 
 async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]:
-    """מעלה קובץ mp3 לתיקיית ivr2 הייעודית בימות המשיח. מחזיר את הנתיב הפנימי
-    שנקבע (לשימוש בפקודת הניגון), או None אם ההעלאה נכשלה."""
+    """מעלה קובץ mp3 לשלוחת ivr2 הייעודית בימות המשיח. מחזיר את הנתיב הפנימי
+    שנקבע, או None אם ההעלאה נכשלה.
+
+    חשוב לגבי תזמון: לפי דיווח אמיתי בפורום המפתחים, אחרי UpdateExtension
+    לוקח עד כ-2 דקות עד שהשלוחה החדשה 'נתפסת' בפועל אצל ימות. מכיוון שזו
+    שיחת טלפון חיה עם timeout אמיתי מצד המרכזיה (לא ידוע לנו בדיוק כמה, אבל
+    בטוח לא 2 דקות) — אסור לנו לחכות כל כך הרבה זמן בתוך הבקשה עצמה. לכן:
+    בתוך השיחה מנסים רק פעמיים, מהר (0s, 3s). אם זו שלוחה חדשה וזה נכשל,
+    מפעילים warm-up ברקע (לא חוסם את התשובה למרכזיה) שממשיך לנסות במשך עד
+    כ-2 דקות — כך שהשיר הראשון ייפול לשיטת ה-URL הישנה פעם אחת בלבד, אבל
+    כל בקשה הבאה (לאותו שיר או לשיר אחר) תעבוד כרגיל ברגע שההפצה תושלם."""
     yemot_path = f"{YEMOT_UPLOAD_FOLDER}/{video_id}.mp3"
+    is_new_folder = YEMOT_UPLOAD_FOLDER not in _yemot_dirs_ensured
     await _yemot_ensure_dir(YEMOT_UPLOAD_FOLDER)
 
     async def _do_upload(token: str) -> httpx.Response:
@@ -1315,30 +1328,80 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
     if not token:
         return None
 
-    try:
-        resp = await _do_upload(token)
-        data = resp.json()
-        if data.get("responseStatus") != "OK":
-            # ייתכן שה-token פג, או (סביר יותר) שהתיקייה עדיין לא הייתה קיימת
-            # בניסיון הראשון — מוודאים שוב שהיא נוצרה ומנסים עם login מאולץ.
-            logger.warning("Yemot UploadFile first attempt failed (%s) — retrying (fresh login + ensure dir)",
-                            _safe_json_snippet_early(data))
-            _yemot_dirs_ensured.discard(YEMOT_UPLOAD_FOLDER)
-            await _yemot_ensure_dir(YEMOT_UPLOAD_FOLDER)
-            token = await _yemot_login(force=True)
-            if not token:
-                return None
+    # בתוך השיחה החיה: ניסיון מהיר בלבד, לא לחכות דקות על חשבון המתקשר.
+    quick_delays = [0, 3]
+    last_error_data = None
+    for i, delay in enumerate(quick_delays):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
             resp = await _do_upload(token)
             data = resp.json()
-            if data.get("responseStatus") != "OK":
-                logger.error("Yemot UploadFile failed for %s: %s", video_id, _safe_json_snippet_early(data))
-                return None
+        except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+            logger.error("Yemot UploadFile request failed for %s: %s", video_id, e)
+            return None
 
-        logger.info("✅ Yemot UploadFile success for %s → %s", video_id, yemot_path)
-        return yemot_path
-    except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
-        logger.error("Yemot UploadFile request failed for %s: %s", video_id, e)
-        return None
+        if data.get("responseStatus") == "OK":
+            logger.info("✅ Yemot UploadFile success for %s → %s (attempt %d/%d)",
+                        video_id, yemot_path, i + 1, len(quick_delays))
+            return yemot_path
+
+        last_error_data = data
+        logger.warning("Yemot UploadFile attempt %d/%d failed for %s: %s",
+                        i + 1, len(quick_delays), video_id, _safe_json_snippet_early(data))
+        token = await _yemot_login(force=True) or token
+
+    logger.warning("Yemot UploadFile quick attempts exhausted for %s: %s",
+                    video_id, _safe_json_snippet_early(last_error_data))
+
+    if is_new_folder:
+        # שלוחה חדשה שכנראה עדיין לא הופצה — ממשיכים לנסות ברקע (בלי לעכב
+        # את התשובה הנוכחית למרכזיה), כדי שהבקשה הבאה תעבוד חלק.
+        logger.info("🕒 Starting background warm-up retry for new Yemot folder %s (up to ~2 min)",
+                    YEMOT_UPLOAD_FOLDER)
+        asyncio.create_task(_yemot_upload_warmup(video_id, audio_bytes, yemot_path))
+
+    return None
+
+
+async def _yemot_upload_warmup(video_id: str, audio_bytes: bytes, yemot_path: str) -> None:
+    """ריצה ברקע בלבד (לא במסגרת שיחה חיה): ממשיכה לנסות להעלות עם השהיות
+    גדלות עד שהשלוחה החדשה מופצת בימות (עד כ-2 דקות לפי דיווחים בפורום),
+    ושומרת ל-DB אם וכשמצליחה — כדי שבקשות עתידיות ימצאו אותה בקאש מיד."""
+    for delay in (10, 20, 30, 45):
+        await asyncio.sleep(delay)
+        token = await _yemot_login()
+        if not token:
+            continue
+        try:
+            assert http_client is not None
+            resp = await http_client.post(
+                f"{YEMOT_API_BASE}/UploadFile",
+                data={"token": token, "path": yemot_path, "convertAudio": "1"},
+                files={"file": (f"{video_id}.mp3", audio_bytes, "audio/mpeg")},
+                timeout=30.0,
+            )
+            data = resp.json()
+        except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+            logger.warning("Yemot warm-up upload attempt failed: %s", e)
+            continue
+
+        if data.get("responseStatus") == "OK":
+            logger.info("✅ Yemot warm-up upload succeeded for %s → %s — folder is ready for future requests",
+                        video_id, yemot_path)
+            await run_db_query(
+                "INSERT OR REPLACE INTO yemot_uploads (video_id, yemot_path, uploaded_at) VALUES (?, ?, ?)",
+                (video_id, yemot_path, utcnow().isoformat()),
+                commit=True,
+            )
+            return
+        logger.warning("Yemot warm-up upload still failing: %s", _safe_json_snippet_early(data))
+
+    logger.error(
+        "Yemot warm-up gave up after ~105s for folder %s — the path format is very likely still wrong, "
+        "not just a propagation delay. Use /debug/yemot with target_ext to find the correct one.",
+        YEMOT_UPLOAD_FOLDER,
+    )
 
 
 async def _yemot_delete_file(path: str) -> bool:
@@ -2024,11 +2087,16 @@ async def debug_search(q: str = Query(...), token: str = Query(None), verbose: i
 
 
 @app.get("/debug/yemot")
-async def debug_yemot(token: str = Query(None)):
+async def debug_yemot(token: str = Query(None), target_ext: str = Query(None)):
     """כלי אבחון מקיף לימות המשיח: מריץ Login, ואז מנסה כמה וריאציות שונות
     של פורמט הנתיב על CreateIVR2Dir ו-UploadFile (עם קובץ דמה קטן), ומחזיר
     את *כל* התגובות הגולמיות מהשרת בבת אחת. המטרה: לגלות באיזה פורמט נתיב
     ימות המשיח שלכם בפועל מצפה, בלי עוד סבב שלם של שיחת טלפון + דפלוי.
+
+    target_ext (אופציונלי, מומלץ מאוד): מספר שלוחה אמיתי שיצרתם ידנית בפאנל
+    הניהול של ימות (למשל '90' או '9/5') — בודק גם נתיבים שמצביעים עליה.
+    זו ההשערה הכי סבירה כרגע: שחייבים שלוחה אמיתית קיימת, לא תיקייה חופשית.
+
     מנוטרל לגמרי (404) אם IVR_DEBUG_TOKEN לא הוגדר."""
     if not DEBUG_TOKEN:
         raise HTTPException(404)
@@ -2049,31 +2117,46 @@ async def debug_yemot(token: str = Query(None)):
         report["conclusion"] = "Login עצמו נכשל — בדקו YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD"
         return report
 
-    # --- וריאציות פורמט לתיקייה (CreateIVR2Dir), וגם GET וגם POST — כי
-    # "Invalid WS request" יכול להעיד על אי-התאמת method ולא רק פורמט נתיב ---
-    dir_variants = ["ivr2:/ai_songs", "ivr2:ai_songs", "ai_songs", "/ai_songs", "ivr2:/1", "ivr2:1"]
-    report["create_dir_attempts"] = []
+    # --- UpdateExtension: זו הפקודה האמיתית ליצירת שלוחה (מאומתת מול המדריך
+    # הרשמי למתחילים ב-API) — לא CreateIVR2Dir, שכשל בעקביות בכל בדיקה קודמת
+    # וכנראה endpoint מת/שגוי. אם target_ext סופק, בודקים גם אותו במפורש.
+    dir_variants = ["ivr2:/ai_songs", "ivr2:ai_songs", "ai_songs", "/ai_songs"]
+    if target_ext:
+        clean_ext = target_ext.strip().strip("/")
+        dir_variants = [f"ivr2:/{clean_ext}", f"ivr2:{clean_ext}"] + dir_variants
+    report["update_extension_attempts"] = []
+    created_paths = []
     for variant in dir_variants:
-        for method in ("GET", "POST"):
-            try:
-                if method == "GET":
-                    resp = await http_client.get(
-                        f"{YEMOT_API_BASE}/CreateIVR2Dir",
-                        params={"token": yemot_token, "path": variant},
-                        timeout=10.0,
-                    )
-                else:
-                    resp = await http_client.post(
-                        f"{YEMOT_API_BASE}/CreateIVR2Dir",
-                        data={"token": yemot_token, "path": variant},
-                        timeout=10.0,
-                    )
-                data = resp.json()
-            except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
-                data = {"error": str(e)}
-            report["create_dir_attempts"].append({"path_tried": variant, "method": method, "raw_response": data})
+        try:
+            resp = await http_client.post(
+                f"{YEMOT_API_BASE}/UpdateExtension",
+                data={"token": yemot_token, "path": variant},
+                timeout=10.0,
+            )
+            data = resp.json()
+        except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+            data = {"error": str(e)}
+        report["update_extension_attempts"].append({"path_tried": variant, "raw_response": data})
+        if isinstance(data, dict) and data.get("responseStatus") == "OK":
+            created_paths.append(variant)
+
+    report["propagation_note"] = (
+        "לפי דיווח בפורום המפתחים, UpdateExtension יכול לקחת עד כ-2 דקות עד "
+        "שהשלוחה החדשה 'נתפסת' בפועל. אם UploadFile למטה נכשל על שלוחה "
+        "שדווקא הצליחה כאן (responseStatus=OK) — נסו שוב את /debug/yemot "
+        "הזה בעוד דקה-שתיים לפני שמסיקים שהפורמט שגוי."
+    )
 
     # --- וריאציות פורמט להעלאת קובץ (UploadFile) — קובץ דמה זעיר, לא שיר אמיתי ---
+    # אם סיפקתם target_ext (מספר שלוחה אמיתי שיצרתם ידנית בפאנל הניהול של
+    # ימות), בודקים גם אותו — זו ההשערה החזקה ביותר כרגע: שהנתיב חייב להצביע
+    # על שלוחה אמיתית שכבר קיימת בחשבון, לא תיקייה וירטואלית חופשית.
+    if created_paths:
+        # המתנה קצרה (לא 2 דקות מלאות — זו קריאת דיבוג אינטראקטיבית, לא שיחה
+        # חיה) לתת סיכוי סביר להפצה לפני שבודקים העלאה.
+        logger.info("Waiting 10s for possible Yemot extension propagation before testing upload...")
+        await asyncio.sleep(10)
+
     dummy_audio = b"\x00" * 200
     upload_variants = [
         "ivr2:/ai_songs/_debugtest.mp3",
@@ -2081,7 +2164,18 @@ async def debug_yemot(token: str = Query(None)):
         "ivr2:/_debugtest.mp3",
         "ivr2:_debugtest.mp3",
         "ivr2:/1/_debugtest.mp3",
+        "1/_debugtest.mp3",           # בלי תחילית ivr2: בכלל
+        "_debugtest.mp3",             # שם קובץ בלבד, בלי תיקייה
     ]
+    if target_ext:
+        clean_ext = target_ext.strip().strip("/")
+        upload_variants = [
+            f"ivr2:/{clean_ext}/_debugtest.mp3",
+            f"ivr2:{clean_ext}/_debugtest.mp3",
+            f"{clean_ext}/_debugtest.mp3",
+            f"ivr2:/{clean_ext}",
+            f"ivr2:{clean_ext}",
+        ] + upload_variants
     report["upload_attempts"] = []
     successful_path = None
     for variant in upload_variants:
