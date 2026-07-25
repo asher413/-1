@@ -188,6 +188,12 @@ YEMOT_API_BASE = os.environ.get("YEMOT_API_BASE", "https://www.call2all.co.il/ym
 # שלוחה לדוגמה בלבד; יש להחליף ב-YEMOT_UPLOAD_FOLDER למספר שלוחה אמיתי
 # שיצרתם מראש (למשל "90" אם פתחתם שלוחה 90 ל-mp3 של השירים).
 YEMOT_UPLOAD_FOLDER = os.environ.get("YEMOT_UPLOAD_FOLDER", "90").strip().strip("/")
+if YEMOT_UPLOAD_FOLDER and not YEMOT_UPLOAD_FOLDER.lower().startswith("ivr2:"):
+    # קריטי: כל דוגמה אמיתית שאומתה בפורום המפתחים משתמשת בתחילית "ivr2:"
+    # (למשל ivr2:1/M1000.wav, ivr2:2). לא בדקנו את הקומבינציה הזו יחד עם שם
+    # קובץ מספרי-בלבד בפרודקשן עדיין — כל ניסיון קודם בדק רק אחד מהשניים
+    # בכל פעם. מנרמלים כאן אוטומטית כדי שלא תצטרכו לזכור להוסיף את זה בעצמכם.
+    YEMOT_UPLOAD_FOLDER = f"ivr2:{YEMOT_UPLOAD_FOLDER}"
 
 # מחיקה אוטומטית של השיר מימות המשיח ברגע שהמתקשר יוצא מהקו (hangup) —
 # חוסך מקום אחסון בחשבון ימות שלכם, במחיר איבוד קאש חוצה-משתמשים (אם שני
