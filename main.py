@@ -178,7 +178,8 @@ if not CLEARING_ENABLED:
 # ממשיכה לנסות את שיטת ה-URL הישנה (למקרה שאתם על פלטפורמה אחרת בעתיד).
 YEMOT_SYSTEM_NUMBER = os.environ.get("YEMOT_SYSTEM_NUMBER", "")
 YEMOT_PASSWORD = os.environ.get("YEMOT_PASSWORD", "")
-YEMOT_ENABLED = bool(YEMOT_SYSTEM_NUMBER and YEMOT_PASSWORD)
+YEMOT_API_KEY = os.environ.get("YEMOT_API_KEY", "") # תוספת חדשה לאימות עם טוקן
+YEMOT_ENABLED = bool(YEMOT_API_KEY or (YEMOT_SYSTEM_NUMBER and YEMOT_PASSWORD))
 YEMOT_API_BASE = os.environ.get("YEMOT_API_BASE", "https://www.call2all.co.il/ym/api")
 # נתיב ivr2 להעלאת שירים. לפי תיעוד רשמי של ימות: התחביר הנכון הוא
 # ivr2:<תיקייה>/<קובץ> — בלי לוכסן אחרי הנקודתיים! (ivr2:5/000.wav, לא
@@ -995,7 +996,8 @@ async def _candidate_stream_urls(video_id: str) -> List[str]:
     candidates: List[str] = []
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    for inst in ["https://api.cobalt.tools/api/json", "https://cobalt.api.v0.wtf/api/json"]:
+    # הוסרה הכתובת cobat.api.v0.wtf שגרמה לשגיאות רשת
+    for inst in ["https://api.cobalt.tools/api/json"]:
         candidates.append(f"cobalt::{inst}::{watch_url}")
 
     if RAPIDAPI_KEY:
@@ -1240,6 +1242,9 @@ _yemot_login_lock = asyncio.Lock()
 async def _yemot_login(force: bool = False) -> Optional[str]:
     """מתחבר עם מספר מערכת+סיסמה ומקבל token זמני, עם קאש (ברירת מחדל: מרענן
     כל 25 דקות ליתר ביטחון, גם אם לא ידוע לנו במדויק כמה זמן token תקף)."""
+    if YEMOT_API_KEY:
+        return YEMOT_API_KEY
+        
     global _yemot_token, _yemot_token_expires_at
     if not YEMOT_ENABLED:
         return None
@@ -1269,7 +1274,6 @@ async def _yemot_login(force: bool = False) -> Optional[str]:
         except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
             logger.error("Yemot Login request failed: %s", e)
             return None
-
 
 def _safe_json_snippet_early(data, limit: int = 500) -> str:
     """גרסה מוקדמת של _safe_json_snippet (מוגדר שוב במלואו בהמשך הקובץ) —
@@ -1771,10 +1775,9 @@ async def _play_command_or_error(video_id: str, request: Request, session_key: O
         yemot_path = await ensure_uploaded_to_yemot(video_id, session_key)
         if yemot_path:
             return YEMOT_PLAY_TEMPLATE.format(yemot_path=yemot_path, video_id=video_id)
-        logger.warning(
-            "Yemot upload failed/unavailable for %s — falling back to URL-based play command "
-            "(won't work on real Yemot, but keeps the call from dying silently)", video_id,
-        )
+        
+        logger.error("Yemot upload failed for %s. Refusing to fallback to URL streaming on Yemot.", video_id)
+        return _generic_error_command()
 
     cmd = _get_url_based_play_command(video_id, request)
     return cmd if cmd is not None else _generic_error_command()
@@ -1875,6 +1878,14 @@ async def _load_or_create_session(phone: str, is_whitelisted: bool) -> Tuple[str
 # ==========================================
 @app.get("/youtube", response_class=PlainTextResponse)
 async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str = Query(None)):
+    # הבדיקה הועברה להתחלה: עצירה מוחלטת ומיידית בסיום שיחה (Hangup)
+    if hangup == "yes":
+        if YEMOT_AUTO_DELETE_AFTER_PLAY and ApiPhone:
+            session_key = ApiPhone.strip()
+            if session_key.lower() not in ANONYMOUS_PHONE_VALUES:
+                asyncio.create_task(cleanup_session_uploads(session_key))
+        return "OK"
+
     if not ApiPhone:
         return "OK"
 
@@ -1900,13 +1911,6 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
             logger.warning("Rejected malformed phone: %r", raw_phone)
             return "OK"
         session_key = raw_phone
-
-    if hangup == "yes":
-        # המתקשר יצא מהקו — אם הוגדר מחיקה אוטומטית אחרי השמעה, מוחקים עכשיו
-        # מימות המשיח את כל השירים שהועלו במהלך השיחה הזו (שחרור מקום אחסון).
-        if YEMOT_AUTO_DELETE_AFTER_PLAY:
-            asyncio.create_task(cleanup_session_uploads(session_key))
-        return "OK"
 
     val_params = [v for k, v in request.query_params.multi_items() if k == "ValName"]
     ValName = (val_params[-1] if val_params else None)
