@@ -1415,18 +1415,22 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
     זו שלוחה חדשה וזה נכשל, מפעילים warm-up ברקע (לא חוסם את התשובה
     למרכזיה) שממשיך לנסות במשך עד כ-2 דקות."""
     file_num = await _next_yemot_file_number()
-    upload_filename = f"{file_num}.mp3"          # שם הקובץ הנשלח בפועל (multipart) — הפורמט המקורי
-    dest_filename = f"{file_num}.wav"            # מה שמופיע ב-path — הפורמט הטלפוני היעד (ר' הערה למעלה)
+    dest_filename = f"{file_num}.wav"  # גם ב-path וגם בשם הקובץ שנשלח ב-multipart — זהים בכוונה עכשיו
     yemot_path = f"{YEMOT_UPLOAD_FOLDER}/{dest_filename}"
     is_new_folder = YEMOT_UPLOAD_FOLDER not in _yemot_dirs_ensured
     await _yemot_ensure_dir(YEMOT_UPLOAD_FOLDER)
 
     async def _do_upload(token: str) -> httpx.Response:
         assert http_client is not None
+        # ניסוי: שם הקובץ ב-multipart זהה לחלוטין לזה שב-path (כולל סיומת
+        # .wav), במקום לשלוח .mp3 בפועל עם .wav רק ביעד. אם ימות מזהה את
+        # הקובץ בפועל בסניפינג בינארי (לא לפי שם) ו-convertAudio=1 עדיין
+        # ממיר נכון, זה לא אמור לשבור כלום; אם אי-ההתאמה בין השמות היא
+        # שגרמה ל-IllegalStateException, זה אמור לפתור.
         return await http_client.post(
             f"{YEMOT_API_BASE}/UploadFile",
             data={"token": token, "path": yemot_path, "convertAudio": "1"},
-            files={"file": (upload_filename, audio_bytes, "audio/mpeg")},
+            files={"file": (dest_filename, audio_bytes, "audio/mpeg")},
             timeout=30.0,
         )
 
@@ -1474,10 +1478,9 @@ async def _yemot_upload_warmup(video_id: str, audio_bytes: bytes, yemot_path: st
     """ריצה ברקע בלבד (לא במסגרת שיחה חיה): ממשיכה לנסות להעלות עם השהיות
     גדלות עד שהשלוחה החדשה מופצת בימות (עד כ-2 דקות לפי דיווחים בפורום),
     ושומרת ל-DB אם וכשמצליחה — כדי שבקשות עתידיות ימצאו אותה בקאש מיד."""
-    # yemot_path מסתיים ב-.wav (יעד טלפוני); שם הקובץ שנשלח בפועל ב-multipart
-    # נשאר .mp3 (הפורמט המקורי, עם convertAudio=1 שממיר בצד ימות).
+    # שם הקובץ ב-multipart זהה עכשיו לזה שב-path (גם הוא .wav) — ר' הערה
+    # מקבילה ב-_yemot_upload_file.
     dest_filename = yemot_path.rsplit("/", 1)[-1]
-    upload_filename = dest_filename.rsplit(".", 1)[0] + ".mp3"
     for delay in (10, 20, 30, 45):
         await asyncio.sleep(delay)
         token = await _yemot_login()
@@ -1488,7 +1491,7 @@ async def _yemot_upload_warmup(video_id: str, audio_bytes: bytes, yemot_path: st
             resp = await http_client.post(
                 f"{YEMOT_API_BASE}/UploadFile",
                 data={"token": token, "path": yemot_path, "convertAudio": "1"},
-                files={"file": (upload_filename, audio_bytes, "audio/mpeg")},
+                files={"file": (dest_filename, audio_bytes, "audio/mpeg")},
                 timeout=30.0,
             )
             data = resp.json()
