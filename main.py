@@ -1393,6 +1393,32 @@ async def _next_yemot_file_number() -> int:
     return num
 
 
+def _bare_yemot_extension() -> str:
+    """מחלץ את מספר השלוחה הגולמי מ-YEMOT_UPLOAD_FOLDER (מסיר קידומת ivr2: אם יש)."""
+    folder = YEMOT_UPLOAD_FOLDER
+    if folder.lower().startswith("ivr2:"):
+        folder = folder[5:]
+    return folder.strip("/")
+
+
+def _yemot_path_candidates(dest_filename: str) -> List[str]:
+    """בונה רשימת נתיבים מועמדים בכמה סכמות כתובות שונות, כי מהבדיקה
+    האמפירית (via /debug/yemot) עולה תבנית ברורה: *כל* נתיב עם קידומת
+    'ivr2:' נכשל ב-UploadFile עם IllegalStateException (למרות שאותה קידומת
+    עובדת מצוין ל-UpdateExtension/UploadTextFile!), ו*כל* נתיב בלי קידומת
+    נכשל עם שגיאה שונה ('path is invalid', מפורש יותר). זה מרמז חזק
+    ש-UploadFile כנראה לא משתמש בסכמת 'ivr2:' בכלל, אלא בסכמה ישנה יותר:
+    'ivr/<שלוחה>/<תת-שלוחה>/<קובץ>' (בלי נקודתיים) — לכן מנסים כמה וריאציות
+    של הסכמה הזו כאן, בנוסף לסכמת ivr2: הרגילה, לפני שנופלים לגמרי."""
+    ext_num = _bare_yemot_extension()
+    return [
+        f"{YEMOT_UPLOAD_FOLDER}/{dest_filename}",          # סכמת ivr2: (ברירת המחדל עד כה)
+        f"ivr/{ext_num}/{dest_filename}",                   # סכמה ישנה, 2 רמות
+        f"ivr/{ext_num}/1/{dest_filename}",                 # סכמה ישנה, 3 רמות (שלוחה/תת-שלוחה/קובץ)
+        f"ivr/1/{ext_num}/{dest_filename}",                 # סכמה ישנה, סדר הפוך
+    ]
+
+
 async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]:
     """מעלה קובץ mp3 לשלוחת ivr2 הייעודית בימות המשיח. מחזיר את הנתיב הפנימי
     שנקבע, או None אם ההעלאה נכשלה.
@@ -1401,35 +1427,31 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
     כל הדוגמאות האמיתיות שמצאנו (1000.wav, 002.wav, M1101.wav) הן שמות
     *קצרים* — לכן משתמשים כאן במספר רץ קצר (ר' _next_yemot_file_number).
 
-    קריטי #2 (מקור: ניתוח תיעוד רשמי): פורמט הקבצים הטלפוני של ימות הוא
-    WAV (PCM, 8000Hz, מונו) — ולכן ה-*נתיב היעד* (פרמטר path) חייב לציין
-    סיומת .wav, גם כשמעלים בפועל קובץ mp3 עם convertAudio=1 (השרת ממיר
-    אוטומטית לפורמט הטלפוני; ה-path רק אומר איך הקובץ *ייקרא* אחרי ההמרה).
-    זו ככל הנראה הסיבה האמיתית לכל הכישלונות הקודמים — לא השלוחה, לא
-    האותיות בשם, אלא הסיומת עצמה.
+    קריטי #2: פורמט הקבצים הטלפוני של ימות הוא WAV — ה-*נתיב היעד* (path)
+    חייב לציין סיומת .wav, גם כשמעלים בפועל קובץ mp3 עם convertAudio=1.
+
+    קריטי #3 (מבדיקה אמפירית אמיתית מול /debug/yemot): מנסים כמה *סכמות
+    כתובות* שונות (לא רק תיקיות שונות תחת אותה סכמה) — ר' _yemot_path_candidates.
 
     חשוב גם לגבי תזמון: לפי דיווח אמיתי בפורום המפתחים, אחרי UpdateExtension
     לוקח עד כ-2 דקות עד שהשלוחה החדשה 'נתפסת' בפועל אצל ימות. מכיוון שזו
     שיחת טלפון חיה עם timeout אמיתי מצד המרכזיה — אסור לנו לחכות כל כך הרבה
-    זמן בתוך הבקשה עצמה. לכן: בתוך השיחה מנסים רק פעמיים, מהר (0s, 3s). אם
-    זו שלוחה חדשה וזה נכשל, מפעילים warm-up ברקע (לא חוסם את התשובה
-    למרכזיה) שממשיך לנסות במשך עד כ-2 דקות."""
+    זמן בתוך הבקשה עצמה. לכן: בתוך השיחה מנסים את כל הסכמות מהר (בלי השהיה
+    בין ניסיונות שונים — זו לא בעיית תזמון אלא בעיית פורמט). אם הכל נכשל
+    ומדובר בשלוחה חדשה, מפעילים warm-up ברקע (לא חוסם את התשובה למרכזיה)
+    שממשיך לנסות במשך עד כ-2 דקות, למקרה שכן מדובר בהפצה איטית."""
     file_num = await _next_yemot_file_number()
-    dest_filename = f"{file_num}.wav"  # גם ב-path וגם בשם הקובץ שנשלח ב-multipart — זהים בכוונה עכשיו
-    yemot_path = f"{YEMOT_UPLOAD_FOLDER}/{dest_filename}"
+    dest_filename = f"{file_num}.wav"  # גם ב-path וגם בשם הקובץ שנשלח ב-multipart — זהים בכוונה
     is_new_folder = YEMOT_UPLOAD_FOLDER not in _yemot_dirs_ensured
     await _yemot_ensure_dir(YEMOT_UPLOAD_FOLDER)
 
-    async def _do_upload(token: str) -> httpx.Response:
+    candidates = _yemot_path_candidates(dest_filename)
+
+    async def _do_upload(token: str, path: str) -> httpx.Response:
         assert http_client is not None
-        # ניסוי: שם הקובץ ב-multipart זהה לחלוטין לזה שב-path (כולל סיומת
-        # .wav), במקום לשלוח .mp3 בפועל עם .wav רק ביעד. אם ימות מזהה את
-        # הקובץ בפועל בסניפינג בינארי (לא לפי שם) ו-convertAudio=1 עדיין
-        # ממיר נכון, זה לא אמור לשבור כלום; אם אי-ההתאמה בין השמות היא
-        # שגרמה ל-IllegalStateException, זה אמור לפתור.
         return await http_client.post(
             f"{YEMOT_API_BASE}/UploadFile",
-            data={"token": token, "path": yemot_path, "convertAudio": "1"},
+            data={"token": token, "path": path, "convertAudio": "1"},
             files={"file": (dest_filename, audio_bytes, "audio/mpeg")},
             timeout=30.0,
         )
@@ -1438,82 +1460,80 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
     if not token:
         return None
 
-    # בתוך השיחה החיה: ניסיון מהיר בלבד, לא לחכות דקות על חשבון המתקשר.
-    quick_delays = [0, 3]
     last_error_data = None
-    for i, delay in enumerate(quick_delays):
-        if delay:
-            await asyncio.sleep(delay)
+    for i, candidate_path in enumerate(candidates):
         try:
-            resp = await _do_upload(token)
+            resp = await _do_upload(token, candidate_path)
             data = resp.json()
         except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
-            logger.error("Yemot UploadFile request failed for %s: %s", video_id, e)
-            return None
+            logger.error("Yemot UploadFile request failed for %s (path=%r): %s", video_id, candidate_path, e)
+            continue
 
         if data.get("responseStatus") == "OK":
-            logger.info("✅ Yemot UploadFile success for %s → %s (attempt %d/%d)",
-                        video_id, yemot_path, i + 1, len(quick_delays))
-            return yemot_path
+            logger.info("✅ Yemot UploadFile success for %s → %s (scheme %d/%d)",
+                        video_id, candidate_path, i + 1, len(candidates))
+            return candidate_path
 
         last_error_data = data
-        logger.warning("Yemot UploadFile attempt %d/%d failed for %s (path=%r): %s",
-                        i + 1, len(quick_delays), video_id, yemot_path, _safe_json_snippet_early(data))
-        token = await _yemot_login(force=True) or token
+        logger.warning("Yemot UploadFile scheme %d/%d failed for %s (path=%r): %s",
+                        i + 1, len(candidates), video_id, candidate_path, _safe_json_snippet_early(data))
 
-    logger.warning("Yemot UploadFile quick attempts exhausted for %s (path=%r): %s",
-                    video_id, yemot_path, _safe_json_snippet_early(last_error_data))
+    logger.warning("Yemot UploadFile: all %d path schemes failed for %s. Last error: %s",
+                    len(candidates), video_id, _safe_json_snippet_early(last_error_data))
 
     if is_new_folder:
         # שלוחה חדשה שכנראה עדיין לא הופצה — ממשיכים לנסות ברקע (בלי לעכב
         # את התשובה הנוכחית למרכזיה), כדי שהבקשה הבאה תעבוד חלק.
         logger.info("🕒 Starting background warm-up retry for new Yemot folder %s (up to ~2 min)",
                     YEMOT_UPLOAD_FOLDER)
-        asyncio.create_task(_yemot_upload_warmup(video_id, audio_bytes, yemot_path))
+        asyncio.create_task(_yemot_upload_warmup(video_id, audio_bytes, dest_filename))
 
     return None
 
 
-async def _yemot_upload_warmup(video_id: str, audio_bytes: bytes, yemot_path: str) -> None:
-    """ריצה ברקע בלבד (לא במסגרת שיחה חיה): ממשיכה לנסות להעלות עם השהיות
-    גדלות עד שהשלוחה החדשה מופצת בימות (עד כ-2 דקות לפי דיווחים בפורום),
-    ושומרת ל-DB אם וכשמצליחה — כדי שבקשות עתידיות ימצאו אותה בקאש מיד."""
-    # שם הקובץ ב-multipart זהה עכשיו לזה שב-path (גם הוא .wav) — ר' הערה
-    # מקבילה ב-_yemot_upload_file.
-    dest_filename = yemot_path.rsplit("/", 1)[-1]
+async def _yemot_upload_warmup(video_id: str, audio_bytes: bytes, dest_filename: str) -> None:
+    """ריצה ברקע בלבד (לא במסגרת שיחה חיה): ממשיכה לנסות להעלות — עם כל
+    סכמות הנתיב (ר' _yemot_path_candidates) — עם השהיות גדלות, עד שהשלוחה
+    מופצת בימות (עד כ-2 דקות לפי דיווחים בפורום) או שאחת הסכמות מצליחה.
+    שומרת ל-DB אם וכשמצליחה — כדי שבקשות עתידיות ימצאו אותה בקאש מיד."""
+    candidates = _yemot_path_candidates(dest_filename)
     for delay in (10, 20, 30, 45):
         await asyncio.sleep(delay)
         token = await _yemot_login()
         if not token:
             continue
-        try:
-            assert http_client is not None
-            resp = await http_client.post(
-                f"{YEMOT_API_BASE}/UploadFile",
-                data={"token": token, "path": yemot_path, "convertAudio": "1"},
-                files={"file": (dest_filename, audio_bytes, "audio/mpeg")},
-                timeout=30.0,
-            )
-            data = resp.json()
-        except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
-            logger.warning("Yemot warm-up upload attempt failed: %s", e)
-            continue
 
-        if data.get("responseStatus") == "OK":
-            logger.info("✅ Yemot warm-up upload succeeded for %s → %s — folder is ready for future requests",
-                        video_id, yemot_path)
-            await run_db_query(
-                "INSERT OR REPLACE INTO yemot_uploads (video_id, yemot_path, uploaded_at) VALUES (?, ?, ?)",
-                (video_id, yemot_path, utcnow().isoformat()),
-                commit=True,
-            )
-            return
-        logger.warning("Yemot warm-up upload still failing: %s", _safe_json_snippet_early(data))
+        for candidate_path in candidates:
+            try:
+                assert http_client is not None
+                resp = await http_client.post(
+                    f"{YEMOT_API_BASE}/UploadFile",
+                    data={"token": token, "path": candidate_path, "convertAudio": "1"},
+                    files={"file": (dest_filename, audio_bytes, "audio/mpeg")},
+                    timeout=30.0,
+                )
+                data = resp.json()
+            except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+                logger.warning("Yemot warm-up upload attempt failed (path=%r): %s", candidate_path, e)
+                continue
+
+            if data.get("responseStatus") == "OK":
+                logger.info("✅ Yemot warm-up upload succeeded for %s → %s — folder is ready for future requests",
+                            video_id, candidate_path)
+                await run_db_query(
+                    "INSERT OR REPLACE INTO yemot_uploads (video_id, yemot_path, uploaded_at) VALUES (?, ?, ?)",
+                    (video_id, candidate_path, utcnow().isoformat()),
+                    commit=True,
+                )
+                return
+            logger.warning("Yemot warm-up still failing (path=%r): %s",
+                            candidate_path, _safe_json_snippet_early(data))
 
     logger.error(
-        "Yemot warm-up gave up after ~105s for folder %s — the path format is very likely still wrong, "
-        "not just a propagation delay. Use /debug/yemot with target_ext to find the correct one.",
-        YEMOT_UPLOAD_FOLDER,
+        "Yemot warm-up gave up after ~105s for folder %s (tried %d path schemes each round) — "
+        "the path format is very likely still wrong, not just a propagation delay. "
+        "Use /debug/yemot with target_ext to find the correct one.",
+        YEMOT_UPLOAD_FOLDER, len(candidates),
     )
 
 
@@ -2278,14 +2298,25 @@ async def debug_yemot(token: str = Query(None), target_ext: str = Query(None)):
     debug_file_num = await _next_yemot_file_number()
     # בודקים גם .mp3 וגם .wav ליעד — לפי תיעוד: הפורמט הטלפוני של ימות הוא
     # WAV, ולכן ה-*יעד* (path) צריך להסתיים ב-.wav גם כשמעלים mp3 בפועל
-    # (עם convertAudio=1). זו ההשערה החדשה שאנחנו בודקים כאן במפורש.
+    # (עם convertAudio=1).
+    #
+    # חדש: אחרי שכל וריאציות ה-"ivr2:" נכשלו בעקביות עם IllegalStateException
+    # (בעוד "ivr2:" עצמו כן עבד מצוין ל-UpdateExtension/UploadTextFile),
+    # ולכל הנתיבים החשופים (בלי prefix) חזרה שגיאה *שונה* ("path is invalid",
+    # לא IllegalStateException) — זה מרמז חזק ש-UploadFile כנראה לא משתמש
+    # בכלל בסכמת "ivr2:", אלא בסכמה ישנה יותר: "ivr/<שלוחה>/<תת-שלוחה>/<קובץ>"
+    # (בלי נקודתיים). נמצאה דוגמה אמיתית מאושרת מהעבר עם path כזה שחזר בהצלחה.
     base_names = [f"ivr2:/ai_songs/{debug_file_num}", f"ivr2:ai_songs/{debug_file_num}",
                   f"ivr2:/{debug_file_num}", f"ivr2:{debug_file_num}",
                   f"ivr2:/1/{debug_file_num}", f"1/{debug_file_num}", f"{debug_file_num}"]
     if target_ext:
         clean_ext = target_ext.strip().strip("/")
         base_names = [f"ivr2:/{clean_ext}/{debug_file_num}", f"ivr2:{clean_ext}/{debug_file_num}",
-                      f"{clean_ext}/{debug_file_num}"] + base_names
+                      f"{clean_ext}/{debug_file_num}",
+                      # סכמה ישנה "ivr/" (בלי נקודתיים) — לא נבדקה עדיין כלל
+                      f"ivr/{clean_ext}/{debug_file_num}",
+                      f"ivr/{clean_ext}/1/{debug_file_num}",
+                      f"ivr/1/{clean_ext}/{debug_file_num}"] + base_names
     upload_variants = [f"{base}.{ext}" for base in base_names for ext in ("wav", "mp3")]
     report["upload_attempts"] = []
     successful_path = None
