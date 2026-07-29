@@ -2344,11 +2344,65 @@ async def debug_yemot(token: str = Query(None), target_ext: str = Query(None)):
         # מנקים את קובץ הבדיקה כדי לא להשאיר זבל בחשבון
         await _yemot_delete_file(successful_path)
     else:
-        report["conclusion"] = (
-            "❌ אף וריאציה לא הצליחה. אנא שילחו את כל ה-JSON הזה חזרה — "
-            "התגובות הגולמיות מכילות את הרמז המדויק (exceptionMessage/message) "
-            "לכך שימות דוחה, גם אם הוא ריק במקרים מסוימים."
-        )
+        # סבב שני: אם כל וריאציות ה-path נכשלו (כמו שקרה בפועל), הבעיה כנראה
+        # לא בנתיב בכלל — UploadTextFile הצליח עם path כמעט זהה ל-UploadFile
+        # שנכשל. בודקים כאן משתני multipart אחרים: שם שדה הקובץ, Content-Type,
+        # וערך convertAudio — משתנים שמעולם לא שינינו.
+        probe_path = f"{clean_ext if target_ext else 'ai_songs'}/{debug_file_num}.wav"
+        if not probe_path.startswith("ivr2:"):
+            probe_path = f"ivr2:/{probe_path}"
+        field_names = ["file", "audioFile", "recording", "media", "uploadFile", "content"]
+        content_types = ["audio/wav", "audio/x-wav", "audio/mpeg", "application/octet-stream"]
+        convert_audio_values = ["1", "true", None]
+
+        report["request_shape_attempts"] = []
+        shape_success = None
+        for field_name in field_names:
+            for content_type in content_types:
+                for convert_val in convert_audio_values:
+                    data = {"token": yemot_token, "path": probe_path}
+                    if convert_val is not None:
+                        data["convertAudio"] = convert_val
+                    try:
+                        resp = await http_client.post(
+                            f"{YEMOT_API_BASE}/UploadFile",
+                            data=data,
+                            files={field_name: ("probe.wav", dummy_audio, content_type)},
+                            timeout=15.0,
+                        )
+                        result = resp.json()
+                    except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+                        result = {"error": str(e)}
+                    attempt = {
+                        "field_name": field_name, "content_type": content_type,
+                        "convertAudio": convert_val, "raw_response": result,
+                    }
+                    report["request_shape_attempts"].append(attempt)
+                    if isinstance(result, dict) and result.get("responseStatus") == "OK" and shape_success is None:
+                        shape_success = attempt
+                        break
+                if shape_success:
+                    break
+            if shape_success:
+                break
+
+        if shape_success:
+            await _yemot_delete_file(probe_path)
+            report["conclusion"] = (
+                f"✅ הבעיה לא הייתה בנתיב! נמצאה צורת בקשה עובדת: field_name="
+                f"{shape_success['field_name']!r}, content_type={shape_success['content_type']!r}, "
+                f"convertAudio={shape_success['convertAudio']!r}."
+            )
+        else:
+            report["conclusion"] = (
+                "❌ גם שינוי צורת הבקשה (שם שדה/Content-Type/convertAudio) לא עזר. "
+                "נבדקו עשרות קומבינציות של נתיב וגם עשרות קומבינציות של צורת בקשה, "
+                "כולן נכשלות. בשלב הזה, הכי יעיל לפנות ישירות לתמיכה הטכנית של "
+                "ימות המשיח עם ה-JSON הזה (כולל update_extension_attempts שהצליחו "
+                "לעומת upload_attempts/request_shape_attempts שנכשלו) ולשאול אותם "
+                "במפורש: מה שונה ב-UploadFile לעומת UploadTextFile שגורם ל-"
+                "IllegalStateException, כשאותו token/שלוחה עובדים מצוין בשתי הפקודות האחרות."
+            )
 
     return report
 
