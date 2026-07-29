@@ -178,7 +178,13 @@ if not CLEARING_ENABLED:
 # ממשיכה לנסות את שיטת ה-URL הישנה (למקרה שאתם על פלטפורמה אחרת בעתיד).
 YEMOT_SYSTEM_NUMBER = os.environ.get("YEMOT_SYSTEM_NUMBER", "")
 YEMOT_PASSWORD = os.environ.get("YEMOT_PASSWORD", "")
-YEMOT_API_KEY = os.environ.get("YEMOT_API_KEY", "") # תוספת חדשה לאימות עם טוקן
+# API_KEY ייעודי (נוצר בפאנל הניהול של ימות, עם הרשאה מפורשת לשירות
+# UploadFile) — אם מוגדר, משמש ישירות כ-token ומדלג לגמרי על Login עם
+# username:password. קריטי לפי תיעוד: החל מנובמבר 2025 ימות עשויה לחסום
+# את שיטת ה-Login המסורתית לפעולות מסוימות (כמו UploadFile) אלא אם הוגדר
+# IP מאושר או נעשה שימוש ב-API_KEY. זה מסביר במדויק תסמין שראינו בפועל:
+# Login ו-UpdateExtension הצליחו, אבל UploadFile ספציפית נכשל שוב ושוב.
+YEMOT_API_KEY = os.environ.get("YEMOT_API_KEY", "")
 YEMOT_ENABLED = bool(YEMOT_API_KEY or (YEMOT_SYSTEM_NUMBER and YEMOT_PASSWORD))
 YEMOT_API_BASE = os.environ.get("YEMOT_API_BASE", "https://www.call2all.co.il/ym/api")
 # נתיב ivr2 להעלאת שירים. לפי תיעוד רשמי של ימות: התחביר הנכון הוא
@@ -190,11 +196,10 @@ YEMOT_API_BASE = os.environ.get("YEMOT_API_BASE", "https://www.call2all.co.il/ym
 # שיצרתם מראש (למשל "90" אם פתחתם שלוחה 90 ל-mp3 של השירים).
 YEMOT_UPLOAD_FOLDER = os.environ.get("YEMOT_UPLOAD_FOLDER", "90").strip().strip("/")
 if YEMOT_UPLOAD_FOLDER and not YEMOT_UPLOAD_FOLDER.lower().startswith("ivr2:"):
-    # קריטי: כל דוגמה אמיתית שאומתה בפורום המפתחים משתמשת בתחילית "ivr2:"
-    # (למשל ivr2:1/M1000.wav, ivr2:2). לא בדקנו את הקומבינציה הזו יחד עם שם
-    # קובץ מספרי-בלבד בפרודקשן עדיין — כל ניסיון קודם בדק רק אחד מהשניים
-    # בכל פעם. מנרמלים כאן אוטומטית כדי שלא תצטרכו לזכור להוסיף את זה בעצמכם.
-    YEMOT_UPLOAD_FOLDER = f"ivr2:{YEMOT_UPLOAD_FOLDER}"
+    # קריטי: הדוגמה האמיתית והמאושרת ('עובד פצצה') מהפורום היא בדיוק
+    # "ivr2:/5/ext.ini" — עם לוכסן מיד אחרי הנקודתיים. מנרמלים לאותו פורמט
+    # בדיוק כדי שלא תצטרכו לזכור את זה בעצמכם.
+    YEMOT_UPLOAD_FOLDER = f"ivr2:/{YEMOT_UPLOAD_FOLDER}"
 
 # מחיקה אוטומטית של השיר מימות המשיח ברגע שהמתקשר יוצא מהקו (hangup) —
 # חוסך מקום אחסון בחשבון ימות שלכם, במחיר איבוד קאש חוצה-משתמשים (אם שני
@@ -205,9 +210,17 @@ if YEMOT_UPLOAD_FOLDER and not YEMOT_UPLOAD_FOLDER.lower().startswith("ivr2:"):
 YEMOT_AUTO_DELETE_AFTER_PLAY = os.environ.get("YEMOT_AUTO_DELETE_AFTER_PLAY", "true").lower() == "true"
 if not YEMOT_ENABLED:
     logger.info(
-        "YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD not set — playback will use the "
+        "YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD (or YEMOT_API_KEY) not set — playback will use the "
         "direct-URL method, which Yemot Hamashiach is confirmed NOT to support. "
-        "Set both env vars to enable the upload-first flow that actually works on Yemot."
+        "Set these env vars to enable the upload-first flow that actually works on Yemot."
+    )
+elif YEMOT_API_KEY:
+    logger.info("Yemot auth: using YEMOT_API_KEY directly (bypasses username:password Login entirely)")
+else:
+    logger.info(
+        "Yemot auth: using YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD (Login-based session token). "
+        "If UploadFile keeps failing while Login/UpdateExtension succeed, this may be blocked "
+        "by Yemot's Nov-2025 MFA policy — try setting YEMOT_API_KEY instead."
     )
 YEMOT_RECORDINGS_FOLDER = os.environ.get("YEMOT_RECORDINGS_FOLDER", "ivr2:/ai_recordings").rstrip("/")
 
@@ -996,8 +1009,7 @@ async def _candidate_stream_urls(video_id: str) -> List[str]:
     candidates: List[str] = []
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # הוסרה הכתובת cobat.api.v0.wtf שגרמה לשגיאות רשת
-    for inst in ["https://api.cobalt.tools/api/json"]:
+    for inst in ["https://api.cobalt.tools/api/json", "https://cobalt.api.v0.wtf/api/json"]:
         candidates.append(f"cobalt::{inst}::{watch_url}")
 
     if RAPIDAPI_KEY:
@@ -1241,11 +1253,20 @@ _yemot_login_lock = asyncio.Lock()
 
 async def _yemot_login(force: bool = False) -> Optional[str]:
     """מתחבר עם מספר מערכת+סיסמה ומקבל token זמני, עם קאש (ברירת מחדל: מרענן
-    כל 25 דקות ליתר ביטחון, גם אם לא ידוע לנו במדויק כמה זמן token תקף)."""
+    כל 25 דקות ליתר ביטחון, גם אם לא ידוע לנו במדויק כמה זמן token תקף).
+
+    אם הוגדר YEMOT_API_KEY — משתמשים בו ישירות כ-token, בלי לקרוא ל-Login
+    בכלל. זה קריטי כי לפי תיעוד: החל מנובמבר 2025, ימות עשויה לחסום
+    התחברות מסורתית (username:password) לפעולות API מסוימות אלא אם כן
+    הוגדר IP מאושר או שמשתמשים ב-API_KEY ייעודי. זה עשוי להסביר למה Login
+    ו-UpdateExtension הצליחו (אולי לא מוגבלים) בעוד UploadFile ספציפית נכשל
+    (ר' חשוב: ה-API_KEY חייב להיות מוגדר בפאנל הניהול עם הרשאה מפורשת
+    לשירות UploadFile, אחרת גם הוא ידחה)."""
+    global _yemot_token, _yemot_token_expires_at
+
     if YEMOT_API_KEY:
         return YEMOT_API_KEY
-        
-    global _yemot_token, _yemot_token_expires_at
+
     if not YEMOT_ENABLED:
         return None
 
@@ -1265,7 +1286,11 @@ async def _yemot_login(force: bool = False) -> Optional[str]:
             )
             data = resp.json()
             if data.get("responseStatus") != "OK" or not data.get("token"):
-                logger.error("Yemot Login failed: %s", _safe_json_snippet_early(data))
+                logger.error(
+                    "Yemot Login failed: %s — אם זה FORBIDDEN/EXCEPTION, ייתכן שזו חסימת "
+                    "ה-MFA של נובמבר 2025. שקלו להגדיר YEMOT_API_KEY במקום.",
+                    _safe_json_snippet_early(data),
+                )
                 return None
             _yemot_token = data["token"]
             _yemot_token_expires_at = utcnow() + timedelta(minutes=25)
@@ -1274,6 +1299,7 @@ async def _yemot_login(force: bool = False) -> Optional[str]:
         except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
             logger.error("Yemot Login request failed: %s", e)
             return None
+
 
 def _safe_json_snippet_early(data, limit: int = 500) -> str:
     """גרסה מוקדמת של _safe_json_snippet (מוגדר שוב במלואו בהמשך הקובץ) —
@@ -1288,20 +1314,48 @@ def _safe_json_snippet_early(data, limit: int = 500) -> str:
 _yemot_dirs_ensured: set = set()  # קאש בזיכרון - אילו שלוחות ivr2 כבר נוצרו, כדי לא לקרוא UpdateExtension בכל העלאה
 
 
+async def _yemot_write_ext_ini(folder_path: str, contents: str) -> bool:
+    """כותב את קובץ ext.ini של השלוחה ישירות דרך UploadTextFile — מאומת מול
+    דוגמה אמיתית ומאושרת כעובדת בפורום המפתחים ('עובד פצצה'):
+      UploadTextFile?token=...&what=ivr2:/5/ext.ini&contents=type=...
+    שימו לב לשמות הפרמטרים השונים מ-UploadFile: 'what' (לא 'path') ו-
+    'contents' (לא 'file'). זו כנראה הדרך האמיתית להגדיר type= לשלוחה —
+    ה-type שנשלח כפרמטר ל-UpdateExtension עצמו עלול פשוט להתעלם בשקט,
+    מה שמסביר למה השלוחה 'הצליחה להיווצר' אבל עדיין דחתה העלאות קבצים."""
+    token = await _yemot_login()
+    if not token:
+        return False
+    try:
+        assert http_client is not None
+        resp = await http_client.post(
+            f"{YEMOT_API_BASE}/UploadTextFile",
+            data={"token": token, "what": f"{folder_path}/ext.ini", "contents": contents},
+            timeout=10.0,
+        )
+        data = resp.json()
+        ok = data.get("responseStatus") == "OK"
+        logger.info("Yemot UploadTextFile(ext.ini @ %s/ext.ini): %s", folder_path, _safe_json_snippet_early(data))
+        return ok
+    except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+        logger.warning("Yemot UploadTextFile(ext.ini) failed for %s: %s", folder_path, e)
+        return False
+
+
 async def _yemot_ensure_dir(path: str) -> bool:
-    """יוצר שלוחת ivr2 אם היא לא קיימת עדיין, מסוג 'playfile' (השמעת קבצים) —
-    מאומת מול תיעוד רשימת סוגי השלוחות של ימות: 'playfile = השמעת קבצים
-    type=playfile'. זו כנראה הסיבה שהעלאות עדיין נכשלו למרות שהשלוחה
-    'קיימת': בלי type=playfile היא כנראה נוצרה מסוג ברירת מחדל שלא מיועד
-    לאחסון/השמעת קבצים כלל. מאומת גם מול המדריך הרשמי למתחילים ב-API
-    (לא CreateIVR2Dir — endpoint שגוי/לא פעיל שכשל בעקביות בכל בדיקה קודמת).
-    מחזיר True אם הבקשה עצמה הצליחה (לא בהכרח שהשלוחה כבר זמינה מיד —
-    ר' ההערה על השהיית הפצה ב-_yemot_upload_file)."""
+    """יוצר שלוחת ivr2 אם היא לא קיימת עדיין, ומגדיר אותה כ-'playfile'
+    (השמעת קבצים) בשתי דרכים במקביל — כי לא ברור אילו מהן ימות "מכבד" בפועל:
+      1. UpdateExtension עם type=playfile כפרמטר (יכול להתעלם בשקט).
+      2. כתיבת ext.ini מפורשת עם 'type=playfile' כשורה ראשונה, דרך
+         UploadTextFile — מאומת כעובד בדוגמה אמיתית מהפורום.
+    מחזיר True אם לפחות אחת הדרכים הצליחה. לא בהכרח שהשלוחה כבר זמינה מיד —
+    ר' ההערה על השהיית הפצה ב-_yemot_upload_file."""
     if path in _yemot_dirs_ensured:
         return True
     token = await _yemot_login()
     if not token:
         return False
+
+    ok_update_extension = False
     try:
         assert http_client is not None
         resp = await http_client.post(
@@ -1310,14 +1364,17 @@ async def _yemot_ensure_dir(path: str) -> bool:
             timeout=10.0,
         )
         data = resp.json()
-        ok = data.get("responseStatus") == "OK"
+        ok_update_extension = data.get("responseStatus") == "OK"
         logger.info("Yemot UpdateExtension(%s, type=playfile): %s", path, _safe_json_snippet_early(data))
-        if ok:
-            _yemot_dirs_ensured.add(path)
-        return ok
     except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
         logger.warning("Yemot UpdateExtension failed for %s: %s", path, e)
-        return False
+
+    ok_ext_ini = await _yemot_write_ext_ini(path, "type=playfile\n")
+
+    ok = ok_update_extension or ok_ext_ini
+    if ok:
+        _yemot_dirs_ensured.add(path)
+    return ok
 
 
 async def _next_yemot_file_number() -> int:
@@ -1340,22 +1397,27 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
     """מעלה קובץ mp3 לשלוחת ivr2 הייעודית בימות המשיח. מחזיר את הנתיב הפנימי
     שנקבע, או None אם ההעלאה נכשלה.
 
-    קריטי: מאומת במפורש בפורום המפתחים — 'שם הקובץ צריך לכלול ספרות בלבד'.
-    בנוסף, כל הדוגמאות האמיתיות שמצאנו (1000.wav, 002.wav, M1101.wav) הן
-    שמות *קצרים* — לכן משתמשים כאן במספר רץ קצר (ר' _next_yemot_file_number),
-    לא ב-video_id (שמכיל אותיות) וגם לא בטיימסטמפ ארוך.
+    קריטי #1: מאומת במפורש בפורום המפתחים — 'שם הקובץ צריך לכלול ספרות בלבד'.
+    כל הדוגמאות האמיתיות שמצאנו (1000.wav, 002.wav, M1101.wav) הן שמות
+    *קצרים* — לכן משתמשים כאן במספר רץ קצר (ר' _next_yemot_file_number).
+
+    קריטי #2 (מקור: ניתוח תיעוד רשמי): פורמט הקבצים הטלפוני של ימות הוא
+    WAV (PCM, 8000Hz, מונו) — ולכן ה-*נתיב היעד* (פרמטר path) חייב לציין
+    סיומת .wav, גם כשמעלים בפועל קובץ mp3 עם convertAudio=1 (השרת ממיר
+    אוטומטית לפורמט הטלפוני; ה-path רק אומר איך הקובץ *ייקרא* אחרי ההמרה).
+    זו ככל הנראה הסיבה האמיתית לכל הכישלונות הקודמים — לא השלוחה, לא
+    האותיות בשם, אלא הסיומת עצמה.
 
     חשוב גם לגבי תזמון: לפי דיווח אמיתי בפורום המפתחים, אחרי UpdateExtension
     לוקח עד כ-2 דקות עד שהשלוחה החדשה 'נתפסת' בפועל אצל ימות. מכיוון שזו
-    שיחת טלפון חיה עם timeout אמיתי מצד המרכזיה (לא ידוע לנו בדיוק כמה, אבל
-    בטוח לא 2 דקות) — אסור לנו לחכות כל כך הרבה זמן בתוך הבקשה עצמה. לכן:
-    בתוך השיחה מנסים רק פעמיים, מהר (0s, 3s). אם זו שלוחה חדשה וזה נכשל,
-    מפעילים warm-up ברקע (לא חוסם את התשובה למרכזיה) שממשיך לנסות במשך עד
-    כ-2 דקות — כך שהשיר הראשון ייפול לשיטת ה-URL הישנה פעם אחת בלבד, אבל
-    כל בקשה הבאה (לאותו שיר או לשיר אחר) תעבוד כרגיל ברגע שההפצה תושלם."""
+    שיחת טלפון חיה עם timeout אמיתי מצד המרכזיה — אסור לנו לחכות כל כך הרבה
+    זמן בתוך הבקשה עצמה. לכן: בתוך השיחה מנסים רק פעמיים, מהר (0s, 3s). אם
+    זו שלוחה חדשה וזה נכשל, מפעילים warm-up ברקע (לא חוסם את התשובה
+    למרכזיה) שממשיך לנסות במשך עד כ-2 דקות."""
     file_num = await _next_yemot_file_number()
-    numeric_filename = f"{file_num}.mp3"
-    yemot_path = f"{YEMOT_UPLOAD_FOLDER}/{numeric_filename}"
+    upload_filename = f"{file_num}.mp3"          # שם הקובץ הנשלח בפועל (multipart) — הפורמט המקורי
+    dest_filename = f"{file_num}.wav"            # מה שמופיע ב-path — הפורמט הטלפוני היעד (ר' הערה למעלה)
+    yemot_path = f"{YEMOT_UPLOAD_FOLDER}/{dest_filename}"
     is_new_folder = YEMOT_UPLOAD_FOLDER not in _yemot_dirs_ensured
     await _yemot_ensure_dir(YEMOT_UPLOAD_FOLDER)
 
@@ -1364,7 +1426,7 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
         return await http_client.post(
             f"{YEMOT_API_BASE}/UploadFile",
             data={"token": token, "path": yemot_path, "convertAudio": "1"},
-            files={"file": (numeric_filename, audio_bytes, "audio/mpeg")},
+            files={"file": (upload_filename, audio_bytes, "audio/mpeg")},
             timeout=30.0,
         )
 
@@ -1412,7 +1474,10 @@ async def _yemot_upload_warmup(video_id: str, audio_bytes: bytes, yemot_path: st
     """ריצה ברקע בלבד (לא במסגרת שיחה חיה): ממשיכה לנסות להעלות עם השהיות
     גדלות עד שהשלוחה החדשה מופצת בימות (עד כ-2 דקות לפי דיווחים בפורום),
     ושומרת ל-DB אם וכשמצליחה — כדי שבקשות עתידיות ימצאו אותה בקאש מיד."""
-    numeric_filename = yemot_path.rsplit("/", 1)[-1]  # אותו שם קובץ מספרי שנקבע ב-caller, לא video_id
+    # yemot_path מסתיים ב-.wav (יעד טלפוני); שם הקובץ שנשלח בפועל ב-multipart
+    # נשאר .mp3 (הפורמט המקורי, עם convertAudio=1 שממיר בצד ימות).
+    dest_filename = yemot_path.rsplit("/", 1)[-1]
+    upload_filename = dest_filename.rsplit(".", 1)[0] + ".mp3"
     for delay in (10, 20, 30, 45):
         await asyncio.sleep(delay)
         token = await _yemot_login()
@@ -1423,7 +1488,7 @@ async def _yemot_upload_warmup(video_id: str, audio_bytes: bytes, yemot_path: st
             resp = await http_client.post(
                 f"{YEMOT_API_BASE}/UploadFile",
                 data={"token": token, "path": yemot_path, "convertAudio": "1"},
-                files={"file": (numeric_filename, audio_bytes, "audio/mpeg")},
+                files={"file": (upload_filename, audio_bytes, "audio/mpeg")},
                 timeout=30.0,
             )
             data = resp.json()
@@ -1775,9 +1840,10 @@ async def _play_command_or_error(video_id: str, request: Request, session_key: O
         yemot_path = await ensure_uploaded_to_yemot(video_id, session_key)
         if yemot_path:
             return YEMOT_PLAY_TEMPLATE.format(yemot_path=yemot_path, video_id=video_id)
-        
-        logger.error("Yemot upload failed for %s. Refusing to fallback to URL streaming on Yemot.", video_id)
-        return _generic_error_command()
+        logger.warning(
+            "Yemot upload failed/unavailable for %s — falling back to URL-based play command "
+            "(won't work on real Yemot, but keeps the call from dying silently)", video_id,
+        )
 
     cmd = _get_url_based_play_command(video_id, request)
     return cmd if cmd is not None else _generic_error_command()
@@ -1878,14 +1944,6 @@ async def _load_or_create_session(phone: str, is_whitelisted: bool) -> Tuple[str
 # ==========================================
 @app.get("/youtube", response_class=PlainTextResponse)
 async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str = Query(None)):
-    # הבדיקה הועברה להתחלה: עצירה מוחלטת ומיידית בסיום שיחה (Hangup)
-    if hangup == "yes":
-        if YEMOT_AUTO_DELETE_AFTER_PLAY and ApiPhone:
-            session_key = ApiPhone.strip()
-            if session_key.lower() not in ANONYMOUS_PHONE_VALUES:
-                asyncio.create_task(cleanup_session_uploads(session_key))
-        return "OK"
-
     if not ApiPhone:
         return "OK"
 
@@ -1911,6 +1969,13 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
             logger.warning("Rejected malformed phone: %r", raw_phone)
             return "OK"
         session_key = raw_phone
+
+    if hangup == "yes":
+        # המתקשר יצא מהקו — אם הוגדר מחיקה אוטומטית אחרי השמעה, מוחקים עכשיו
+        # מימות המשיח את כל השירים שהועלו במהלך השיחה הזו (שחרור מקום אחסון).
+        if YEMOT_AUTO_DELETE_AFTER_PLAY:
+            asyncio.create_task(cleanup_session_uploads(session_key))
+        return "OK"
 
     val_params = [v for k, v in request.query_params.multi_items() if k == "ValName"]
     ValName = (val_params[-1] if val_params else None)
@@ -2208,31 +2273,26 @@ async def debug_yemot(token: str = Query(None), target_ext: str = Query(None)):
 
     dummy_audio = b"\x00" * 200
     debug_file_num = await _next_yemot_file_number()
-    debug_filename = f"{debug_file_num}.mp3"  # שם קצר וספרתי - כמו הדוגמאות האמיתיות (1000.wav, 002.wav)
-    upload_variants = [
-        f"ivr2:/ai_songs/{debug_filename}",
-        f"ivr2:ai_songs/{debug_filename}",
-        f"ivr2:/{debug_filename}",
-        f"ivr2:{debug_filename}",
-        f"ivr2:/1/{debug_filename}",
-        f"1/{debug_filename}",           # בלי תחילית ivr2: בכלל
-        debug_filename,                   # שם קובץ בלבד, בלי תיקייה
-    ]
+    # בודקים גם .mp3 וגם .wav ליעד — לפי תיעוד: הפורמט הטלפוני של ימות הוא
+    # WAV, ולכן ה-*יעד* (path) צריך להסתיים ב-.wav גם כשמעלים mp3 בפועל
+    # (עם convertAudio=1). זו ההשערה החדשה שאנחנו בודקים כאן במפורש.
+    base_names = [f"ivr2:/ai_songs/{debug_file_num}", f"ivr2:ai_songs/{debug_file_num}",
+                  f"ivr2:/{debug_file_num}", f"ivr2:{debug_file_num}",
+                  f"ivr2:/1/{debug_file_num}", f"1/{debug_file_num}", f"{debug_file_num}"]
     if target_ext:
         clean_ext = target_ext.strip().strip("/")
-        upload_variants = [
-            f"ivr2:/{clean_ext}/{debug_filename}",
-            f"ivr2:{clean_ext}/{debug_filename}",
-            f"{clean_ext}/{debug_filename}",
-        ] + upload_variants
+        base_names = [f"ivr2:/{clean_ext}/{debug_file_num}", f"ivr2:{clean_ext}/{debug_file_num}",
+                      f"{clean_ext}/{debug_file_num}"] + base_names
+    upload_variants = [f"{base}.{ext}" for base in base_names for ext in ("wav", "mp3")]
     report["upload_attempts"] = []
     successful_path = None
     for variant in upload_variants:
+        upload_filename = "test." + variant.rsplit(".", 1)[-1]  # שם הקובץ הנשלח תמיד תואם לסיומת היעד כאן
         try:
             resp = await http_client.post(
                 f"{YEMOT_API_BASE}/UploadFile",
                 data={"token": yemot_token, "path": variant, "convertAudio": "1"},
-                files={"file": (debug_filename, dummy_audio, "audio/mpeg")},
+                files={"file": (upload_filename, dummy_audio, "audio/mpeg")},
                 timeout=15.0,
             )
             data = resp.json()
