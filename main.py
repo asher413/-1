@@ -32,6 +32,8 @@ import secrets
 import sqlite3
 import logging
 import asyncio
+import subprocess
+import tempfile
 from enum import Enum
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -42,6 +44,17 @@ from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.responses import PlainTextResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from cachetools import TTLCache
+
+# ffmpeg מובא כבינארי ארוז דרך pip (imageio-ffmpeg) — בלי צורך בהתקנת מערכת
+# (apt-get) שלא בטוח שתומכת בה תוכנית Render החינמית. נדרש כדי להמיר את
+# האודיו לפורמט הטלפוני המדויק (WAV PCM, 8000Hz, מונו) שימות המשיח דורשת —
+# גילינו אמפירית ש-convertAudio לא באמת ממיר בצד ימות (ר' הערה ב-Yemot upload).
+try:
+    import imageio_ffmpeg
+    FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
+except ImportError:
+    imageio_ffmpeg = None
+    FFMPEG_BIN = None
 
 # ==========================================
 # 📋 לוגר
@@ -57,6 +70,14 @@ logger = logging.getLogger("IVR_Production_Engine")
 # (ראינו את זה בפועל: "Login?username=...&password=..."). מנמיכים ל-WARNING
 # כדי שרק שגיאות אמיתיות של httpx יופיעו, לא כל בקשה עם הסודות שבתוכה.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+if FFMPEG_BIN is None:
+    logger.warning(
+        "imageio_ffmpeg not installed — add 'imageio-ffmpeg' to requirements.txt! "
+        "Without it, audio uploaded to Yemot won't be converted to the required "
+        "telephony WAV format (PCM, 8000Hz, mono) and playback will likely fail/sound wrong. "
+        "Confirmed empirically: Yemot's own convertAudio parameter does NOT do this conversion."
+    )
 
 
 def utcnow() -> datetime:
@@ -1138,6 +1159,50 @@ async def download_audio_bytes(video_id: str) -> Optional[bytes]:
     return None
 
 
+def _convert_to_telephony_wav_sync(input_bytes: bytes) -> Optional[bytes]:
+    """ממיר אודיו כלשהו (mp3/webm/וכו') ל-WAV PCM 16-bit, 8000Hz, מונו — פורמט
+    הטלפוניה המדויק שימות המשיח דורשת. פונקציה חוסמת (subprocess) — יש
+    להריץ דרך run_in_executor, לא ישירות בקוד אסינכרוני.
+
+    קריטי (התגלה אמפירית דרך /debug/yemot): הפרמטר convertAudio של ימות
+    *לא* באמת ממיר את הקובץ בצד שרת — חובה לשלוח WAV תקני כבר מוכן, אחרת
+    ההעלאה 'מצליחה' (200 OK) אבל השיר בפועל לא יישמע נכון/בכלל בשיחה אמיתית."""
+    if FFMPEG_BIN is None:
+        logger.error("Cannot convert audio to WAV — imageio_ffmpeg not installed")
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".in", delete=False) as fin:
+        fin.write(input_bytes)
+        in_path = fin.name
+    out_path = in_path + ".wav"
+    try:
+        result = subprocess.run(
+            [FFMPEG_BIN, "-y", "-i", in_path, "-ar", "8000", "-ac", "1", "-acodec", "pcm_s16le", out_path],
+            capture_output=True, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.error("ffmpeg conversion failed: %s", result.stderr.decode(errors="replace")[:500])
+            return None
+        with open(out_path, "rb") as f:
+            return f.read()
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logger.error("ffmpeg conversion error: %s", e)
+        return None
+    finally:
+        for p in (in_path, out_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+
+async def convert_to_telephony_wav(input_bytes: bytes) -> Optional[bytes]:
+    """עטיפה אסינכרונית ל-_convert_to_telephony_wav_sync — מריצה את ffmpeg
+    (חוסם, CPU-bound) ב-thread pool כדי לא לחסום את ה-event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _convert_to_telephony_wav_sync, input_bytes)
+
+
 async def _try_buffered_stream(candidate: str, target_url: str, video_id: str, request: Request):
     """מוריד את הקובץ המלא לזיכרון ומחזיר תשובה עם Content-Length מדויק —
     ברירת המחדל, כי זו הדרך הכי תואמת למגוון הרחב ביותר של פלטפורמות IVR."""
@@ -1420,28 +1485,27 @@ def _yemot_path_candidates(dest_filename: str) -> List[str]:
 
 
 async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]:
-    """מעלה קובץ mp3 לשלוחת ivr2 הייעודית בימות המשיח. מחזיר את הנתיב הפנימי
-    שנקבע, או None אם ההעלאה נכשלה.
+    """מעלה קובץ WAV טלפוני תקני לשלוחת ivr2 הייעודית בימות המשיח. מחזיר את
+    הנתיב הפנימי שנקבע, או None אם ההעלאה נכשלה.
 
-    קריטי #1: מאומת במפורש בפורום המפתחים — 'שם הקובץ צריך לכלול ספרות בלבד'.
-    כל הדוגמאות האמיתיות שמצאנו (1000.wav, 002.wav, M1101.wav) הן שמות
-    *קצרים* — לכן משתמשים כאן במספר רץ קצר (ר' _next_yemot_file_number).
+    קריטי #1 (מאומת בפורום): שם קובץ קצר, ספרות בלבד (1000.wav, 002.wav...).
 
-    קריטי #2: פורמט הקבצים הטלפוני של ימות הוא WAV — ה-*נתיב היעד* (path)
-    חייב לציין סיומת .wav, גם כשמעלים בפועל קובץ mp3 עם convertAudio=1.
+    קריטי #2 (מאומת אמפירית דרך /debug/yemot עם בדיקת כל הקומבינציות):
+    - הנתיב (path) חייב סיומת .wav.
+    - Content-Type של הקובץ ב-multipart חייב להיות 'audio/wav', לא audio/mpeg.
+    - פרמטר convertAudio חייב *להיעדר לגמרי* מהבקשה — שליחתו (בכל ערך!)
+      גורמת ל-IllegalStateException. משמעות מעשית: ימות *לא* ממיר את
+      הקובץ בעצמו כשהפרמטר נעדר — ולכן אנחנו חייבים לשלוח WAV טלפוני תקני
+      (PCM, 8000Hz, מונו) כבר מוכן, אחרת ההעלאה תצליח (200 OK) אבל השיר לא
+      יישמע נכון/בכלל בשיחה אמיתית. ר' convert_to_telephony_wav.
+    - סכמת הנתיב שעבדה בפועל: 'ivr/<שלוחה>/<קובץ>.wav' (בלי נקודתיים)."""
+    converted = await convert_to_telephony_wav(audio_bytes)
+    if not converted:
+        logger.error("Audio conversion to telephony WAV failed for %s — cannot upload to Yemot", video_id)
+        return None
 
-    קריטי #3 (מבדיקה אמפירית אמיתית מול /debug/yemot): מנסים כמה *סכמות
-    כתובות* שונות (לא רק תיקיות שונות תחת אותה סכמה) — ר' _yemot_path_candidates.
-
-    חשוב גם לגבי תזמון: לפי דיווח אמיתי בפורום המפתחים, אחרי UpdateExtension
-    לוקח עד כ-2 דקות עד שהשלוחה החדשה 'נתפסת' בפועל אצל ימות. מכיוון שזו
-    שיחת טלפון חיה עם timeout אמיתי מצד המרכזיה — אסור לנו לחכות כל כך הרבה
-    זמן בתוך הבקשה עצמה. לכן: בתוך השיחה מנסים את כל הסכמות מהר (בלי השהיה
-    בין ניסיונות שונים — זו לא בעיית תזמון אלא בעיית פורמט). אם הכל נכשל
-    ומדובר בשלוחה חדשה, מפעילים warm-up ברקע (לא חוסם את התשובה למרכזיה)
-    שממשיך לנסות במשך עד כ-2 דקות, למקרה שכן מדובר בהפצה איטית."""
     file_num = await _next_yemot_file_number()
-    dest_filename = f"{file_num}.wav"  # גם ב-path וגם בשם הקובץ שנשלח ב-multipart — זהים בכוונה
+    dest_filename = f"{file_num}.wav"
     is_new_folder = YEMOT_UPLOAD_FOLDER not in _yemot_dirs_ensured
     await _yemot_ensure_dir(YEMOT_UPLOAD_FOLDER)
 
@@ -1449,10 +1513,12 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
 
     async def _do_upload(token: str, path: str) -> httpx.Response:
         assert http_client is not None
+        # convertAudio במפורש *לא* בפרמטרים — ר' הערה למעלה. שליחתו (בכל
+        # ערך) גורמת ל-IllegalStateException אצל ימות, מאומת אמפירית.
         return await http_client.post(
             f"{YEMOT_API_BASE}/UploadFile",
-            data={"token": token, "path": path, "convertAudio": "1"},
-            files={"file": (dest_filename, audio_bytes, "audio/mpeg")},
+            data={"token": token, "path": path},
+            files={"file": (dest_filename, converted, "audio/wav")},
             timeout=30.0,
         )
 
@@ -1470,9 +1536,13 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
             continue
 
         if data.get("responseStatus") == "OK":
+            # ימות עשוי להחזיר את הנתיב הקנוני שלו ב-response (ראינו בפועל
+            # "path": "ivr/90/1.wav") — עדיף להשתמש בו אם קיים, כדי שפקודת
+            # הניגון תפנה בדיוק למה שימות בעצמו מכיר, לא רק למה שביקשנו.
+            canonical_path = data.get("path") or candidate_path
             logger.info("✅ Yemot UploadFile success for %s → %s (scheme %d/%d)",
-                        video_id, candidate_path, i + 1, len(candidates))
-            return candidate_path
+                        video_id, canonical_path, i + 1, len(candidates))
+            return canonical_path
 
         last_error_data = data
         logger.warning("Yemot UploadFile scheme %d/%d failed for %s (path=%r): %s",
@@ -1486,16 +1556,18 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
         # את התשובה הנוכחית למרכזיה), כדי שהבקשה הבאה תעבוד חלק.
         logger.info("🕒 Starting background warm-up retry for new Yemot folder %s (up to ~2 min)",
                     YEMOT_UPLOAD_FOLDER)
-        asyncio.create_task(_yemot_upload_warmup(video_id, audio_bytes, dest_filename))
+        asyncio.create_task(_yemot_upload_warmup(video_id, converted, dest_filename))
 
     return None
 
 
-async def _yemot_upload_warmup(video_id: str, audio_bytes: bytes, dest_filename: str) -> None:
+async def _yemot_upload_warmup(video_id: str, converted_wav_bytes: bytes, dest_filename: str) -> None:
     """ריצה ברקע בלבד (לא במסגרת שיחה חיה): ממשיכה לנסות להעלות — עם כל
     סכמות הנתיב (ר' _yemot_path_candidates) — עם השהיות גדלות, עד שהשלוחה
     מופצת בימות (עד כ-2 דקות לפי דיווחים בפורום) או שאחת הסכמות מצליחה.
-    שומרת ל-DB אם וכשמצליחה — כדי שבקשות עתידיות ימצאו אותה בקאש מיד."""
+    שומרת ל-DB אם וכשמצליחה — כדי שבקשות עתידיות ימצאו אותה בקאש מיד.
+    מקבלת bytes שכבר הומרו ל-WAV טלפוני (לא mp3 גולמי) — ר' הערה ב-_yemot_upload_file
+    לגבי למה convertAudio לא באמת עושה את ההמרה בצד ימות."""
     candidates = _yemot_path_candidates(dest_filename)
     for delay in (10, 20, 30, 45):
         await asyncio.sleep(delay)
@@ -1506,10 +1578,12 @@ async def _yemot_upload_warmup(video_id: str, audio_bytes: bytes, dest_filename:
         for candidate_path in candidates:
             try:
                 assert http_client is not None
+                # אין convertAudio בפרמטרים בכלל — שליחתו (בכל ערך) גורמת
+                # ל-IllegalStateException, מאומת אמפירית דרך /debug/yemot.
                 resp = await http_client.post(
                     f"{YEMOT_API_BASE}/UploadFile",
-                    data={"token": token, "path": candidate_path, "convertAudio": "1"},
-                    files={"file": (dest_filename, audio_bytes, "audio/mpeg")},
+                    data={"token": token, "path": candidate_path},
+                    files={"file": (dest_filename, converted_wav_bytes, "audio/wav")},
                     timeout=30.0,
                 )
                 data = resp.json()
@@ -1518,11 +1592,12 @@ async def _yemot_upload_warmup(video_id: str, audio_bytes: bytes, dest_filename:
                 continue
 
             if data.get("responseStatus") == "OK":
+                canonical_path = data.get("path") or candidate_path
                 logger.info("✅ Yemot warm-up upload succeeded for %s → %s — folder is ready for future requests",
-                            video_id, candidate_path)
+                            video_id, canonical_path)
                 await run_db_query(
                     "INSERT OR REPLACE INTO yemot_uploads (video_id, yemot_path, uploaded_at) VALUES (?, ?, ?)",
-                    (video_id, candidate_path, utcnow().isoformat()),
+                    (video_id, canonical_path, utcnow().isoformat()),
                     commit=True,
                 )
                 return
