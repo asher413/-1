@@ -1467,17 +1467,22 @@ def _bare_yemot_extension() -> str:
 
 
 def _yemot_path_candidates(dest_filename: str) -> List[str]:
-    """בונה רשימת נתיבים מועמדים בכמה סכמות כתובות שונות. מאומת אמפירית
-    (דרך /debug/yemot, עם צורת הבקשה הנכונה — ר' _yemot_upload_file): הסכמה
-    'ivr/<שלוחה>/<קובץ>' (בלי נקודתיים) היא זו שבאמת עובדת, ולכן מנוסה
-    ראשונה כדי לא לבזבז קריאת API מיותרת על סכמת 'ivr2:' שידוע שנכשלת
-    ב-UploadFile (למרות שהיא כן עובדת ל-UpdateExtension/UploadTextFile)."""
+    """בונה רשימת נתיבים מועמדים בכמה סכמות כתובות שונות.
+
+    תיקון חשוב: אומת אמפירית (דרך /debug/yemot) שהנתיב שבאמת *נשלח* בבקשה
+    המוצלחת היה 'ivr2:/<שלוחה>/<קובץ>' (עם נקודתיים!) — לא 'ivr/<שלוחה>/...'.
+    ה-'ivr/90/1.wav' שחזר ב-response הוא רק השם הקנוני *הפנימי* שימות
+    מדווח בתשובה, לא מה ששלחנו. הבלבול הזה גרם לתיקון שגוי בסבב קודם (שסידר
+    את הסכמות בסדר הפוך) — עכשיו מתוקן חזרה: 'ivr2:' (עם השהיה בהתאם
+    ל-YEMOT_UPLOAD_FOLDER המנורמל) הוא הראשון, כי זה מה שבאמת עבד. הגורם
+    האמיתי לתיקון לא היה סכמת הנתיב בכלל — היה היעדר convertAudio +
+    Content-Type=audio/wav (ר' _yemot_upload_file)."""
     ext_num = _bare_yemot_extension()
     return [
-        f"ivr/{ext_num}/{dest_filename}",                   # מאומת כעובד בפועל — ראשון בכוונה
-        f"ivr/{ext_num}/1/{dest_filename}",                 # וריאציה: 3 רמות (שלוחה/תת-שלוחה/קובץ)
-        f"ivr/1/{ext_num}/{dest_filename}",                 # וריאציה: סדר הפוך
-        f"{YEMOT_UPLOAD_FOLDER}/{dest_filename}",           # סכמת ivr2: — נשמר כ-fallback אחרון בלבד
+        f"{YEMOT_UPLOAD_FOLDER}/{dest_filename}",           # מאומת כעובד בפועל (ivr2:/90/...) — ראשון בכוונה
+        f"ivr/{ext_num}/{dest_filename}",                   # fallback: סכמה ישנה, 2 רמות
+        f"ivr/{ext_num}/1/{dest_filename}",                 # fallback: סכמה ישנה, 3 רמות
+        f"ivr/1/{ext_num}/{dest_filename}",                 # fallback: סדר הפוך
     ]
 
 
