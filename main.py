@@ -1467,20 +1467,17 @@ def _bare_yemot_extension() -> str:
 
 
 def _yemot_path_candidates(dest_filename: str) -> List[str]:
-    """בונה רשימת נתיבים מועמדים בכמה סכמות כתובות שונות, כי מהבדיקה
-    האמפירית (via /debug/yemot) עולה תבנית ברורה: *כל* נתיב עם קידומת
-    'ivr2:' נכשל ב-UploadFile עם IllegalStateException (למרות שאותה קידומת
-    עובדת מצוין ל-UpdateExtension/UploadTextFile!), ו*כל* נתיב בלי קידומת
-    נכשל עם שגיאה שונה ('path is invalid', מפורש יותר). זה מרמז חזק
-    ש-UploadFile כנראה לא משתמש בסכמת 'ivr2:' בכלל, אלא בסכמה ישנה יותר:
-    'ivr/<שלוחה>/<תת-שלוחה>/<קובץ>' (בלי נקודתיים) — לכן מנסים כמה וריאציות
-    של הסכמה הזו כאן, בנוסף לסכמת ivr2: הרגילה, לפני שנופלים לגמרי."""
+    """בונה רשימת נתיבים מועמדים בכמה סכמות כתובות שונות. מאומת אמפירית
+    (דרך /debug/yemot, עם צורת הבקשה הנכונה — ר' _yemot_upload_file): הסכמה
+    'ivr/<שלוחה>/<קובץ>' (בלי נקודתיים) היא זו שבאמת עובדת, ולכן מנוסה
+    ראשונה כדי לא לבזבז קריאת API מיותרת על סכמת 'ivr2:' שידוע שנכשלת
+    ב-UploadFile (למרות שהיא כן עובדת ל-UpdateExtension/UploadTextFile)."""
     ext_num = _bare_yemot_extension()
     return [
-        f"{YEMOT_UPLOAD_FOLDER}/{dest_filename}",          # סכמת ivr2: (ברירת המחדל עד כה)
-        f"ivr/{ext_num}/{dest_filename}",                   # סכמה ישנה, 2 רמות
-        f"ivr/{ext_num}/1/{dest_filename}",                 # סכמה ישנה, 3 רמות (שלוחה/תת-שלוחה/קובץ)
-        f"ivr/1/{ext_num}/{dest_filename}",                 # סכמה ישנה, סדר הפוך
+        f"ivr/{ext_num}/{dest_filename}",                   # מאומת כעובד בפועל — ראשון בכוונה
+        f"ivr/{ext_num}/1/{dest_filename}",                 # וריאציה: 3 רמות (שלוחה/תת-שלוחה/קובץ)
+        f"ivr/1/{ext_num}/{dest_filename}",                 # וריאציה: סדר הפוך
+        f"{YEMOT_UPLOAD_FOLDER}/{dest_filename}",           # סכמת ivr2: — נשמר כ-fallback אחרון בלבד
     ]
 
 
