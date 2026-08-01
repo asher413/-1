@@ -2042,8 +2042,29 @@ async def _load_or_create_session(phone: str, is_whitelisted: bool) -> Tuple[str
 # ==========================================
 # 📞 Main IVR Endpoint
 # ==========================================
-@app.get("/youtube", response_class=PlainTextResponse)
-async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str = Query(None)):
+@app.api_route("/youtube", methods=["GET", "POST"], response_class=PlainTextResponse)
+async def handle_ivr(request: Request):
+    # ימות המשיח עשויה לשלוח GET או POST לשלוחת ה-API (תלוי בהגדרות השלוחה
+    # אצלכם) — תומכים בשניהם כדי לא לקבל 405 Method Not Allowed. הפרמטרים
+    # יכולים להגיע ב-query string וגם/או ב-body (form-urlencoded) גם כש-
+    # המתודה POST, אז ממזגים את שני המקורות.
+    all_items = list(request.query_params.multi_items())
+    if request.method == "POST":
+        try:
+            content_type = request.headers.get("content-type", "")
+            if "form" in content_type:  # x-www-form-urlencoded או multipart/form-data
+                form = await request.form()
+                all_items.extend(form.multi_items())
+        except Exception as e:
+            logger.warning("Failed to parse POST body for /youtube: %s", e)
+
+    def _get_last(key: str) -> Optional[str]:
+        values = [v for k, v in all_items if k == key]
+        return values[-1] if values else None
+
+    ApiPhone = _get_last("ApiPhone")
+    hangup = _get_last("hangup")
+
     if not ApiPhone:
         return "OK"
 
@@ -2055,11 +2076,7 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
         # אין למה "לזכור"), אבל חובה לתת לו session_key ייחודי לשיחה הנוכחית
         # (ApiCallId/ApiYFCallId) ולא "0" קבוע — אחרת כל המתקשרים החסויים
         # היו חולקים session אחד וקופצים על הפלייליסט/מצב אחד של השני.
-        call_id = (
-            request.query_params.get("ApiCallId")
-            or request.query_params.get("ApiYFCallId")
-            or ""
-        ).strip()
+        call_id = (_get_last("ApiCallId") or _get_last("ApiYFCallId") or "").strip()
         if not call_id:
             logger.warning("Anonymous caller with no call id — rejecting")
             return "OK"
@@ -2077,12 +2094,12 @@ async def handle_ivr(request: Request, ApiPhone: str = Query(None), hangup: str 
             asyncio.create_task(cleanup_session_uploads(session_key))
         return "OK"
 
-    val_params = [v for k, v in request.query_params.multi_items() if k == "ValName"]
-    ValName = (val_params[-1] if val_params else None)
+    ValName = _get_last("ValName")
     if ValName is not None:
         ValName = ValName.strip()[:150]
 
-    logger.info("📞 Phone: %s | Session: %s | ValName: %r", raw_phone, session_key, ValName)
+    logger.info("📞 Phone: %s | Session: %s | Method: %s | ValName: %r",
+                raw_phone, session_key, request.method, ValName)
 
     try:
         if await is_rate_limited(session_key):
