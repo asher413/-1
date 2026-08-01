@@ -3,3 +3,4 @@ uvicorn[standard]
 httpx
 cachetools
 imageio-ffmpeg
+python-multipart
