@@ -1036,7 +1036,11 @@ async def _candidate_stream_urls(video_id: str) -> List[str]:
     if RAPIDAPI_KEY:
         candidates.append(f"rapidapi::{video_id}")
 
-    candidates.append(f"invidious::https://invidious.projectsegfau.lt/latest_version?id={video_id}&itag=140")
+    # מספר instances של Invidious (לא רק אחד קבוע) — אותה רשימה ניתנת-לעדכון
+    # שמשמשת גם לחיפוש (IVR_INVIDIOUS_INSTANCES), כי כל instance בודד עלול
+    # להיות לא-זמין/להחזיר תשובת שגיאה זעירה (ראינו את זה בפועל בלוגים).
+    for inst in INVIDIOUS_INSTANCES:
+        candidates.append(f"invidious::{inst}/latest_version?id={video_id}&itag=140")
     return candidates
 
 
@@ -1051,7 +1055,12 @@ async def _resolve_candidate(candidate: str) -> Optional[str]:
                 timeout=4.0,
             )
             if r.status_code == 200:
-                return r.json().get("url")
+                url = r.json().get("url")
+                if url:
+                    return url
+                logger.warning("Cobalt %s returned 200 but no url in response: %s", inst, r.text[:200])
+            else:
+                logger.warning("Cobalt %s returned status %d: %s", inst, r.status_code, r.text[:200])
 
         elif candidate.startswith("rapidapi::"):
             video_id = candidate.split("::", 1)[1]
@@ -1062,13 +1071,20 @@ async def _resolve_candidate(candidate: str) -> Optional[str]:
             )
             if r.status_code == 200:
                 js = r.json()
-                return js.get("file") or js.get("link") or js.get("url")
+                url = js.get("file") or js.get("link") or js.get("url")
+                if url:
+                    return url
+                logger.warning("RapidAPI returned 200 but no file/link/url in response: %s", r.text[:200])
+            else:
+                logger.warning("RapidAPI returned status %d: %s", r.status_code, r.text[:200])
 
         elif candidate.startswith("invidious::"):
             return candidate.split("::", 1)[1]
 
     except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError, ValueError) as e:
-        logger.warning("Candidate resolve failed (%s): %s", candidate[:40], e)
+        # str(e) יכול להיות ריק עבור חלק מסוגי החריגות — מוסיפים גם את שם
+        # המחלקה כדי שהלוג תמיד יכיל מידע שימושי, גם כשההודעה עצמה ריקה.
+        logger.warning("Candidate resolve failed (%s): %s: %s", candidate[:60], type(e).__name__, e)
     return None
 
 
@@ -1190,7 +1206,12 @@ async def download_and_convert_telephony_wav(video_id: str) -> Optional[bytes]:
         except (httpx.HTTPError, asyncio.TimeoutError) as e:
             logger.warning("Audio download failed for %s via %s: %s", video_id, candidate[:40], e)
             continue
-        if resp.status_code != 200 or len(resp.content) == 0:
+        if resp.status_code != 200:
+            logger.warning("Download from %s returned status %d for %s", candidate.split("::")[0],
+                            resp.status_code, video_id)
+            continue
+        if len(resp.content) == 0:
+            logger.warning("Download from %s returned empty body for %s", candidate.split("::")[0], video_id)
             continue
         if len(resp.content) > MAX_STREAM_BYTES:
             logger.warning("Track %s exceeds IVR_MAX_STREAM_BYTES via %s — trying next source",
@@ -1200,6 +1221,12 @@ async def download_and_convert_telephony_wav(video_id: str) -> Optional[bytes]:
         content_type = resp.headers.get("content-type", "unknown")
         logger.info("✅ Audio download succeeded for %s via %s: %d bytes, content-type=%s",
                     video_id, candidate.split("::")[0], len(resp.content), content_type)
+        if len(resp.content) < 1000:
+            # תוכן זעיר עם content-type לא-אודיו הוא כמעט תמיד הודעת שגיאה
+            # טקסטואלית מהמקור (rate limit, video unavailable וכו') — מציגים
+            # אותה במלואה כדי לדעת בדיוק למה, בלי לנחש.
+            logger.warning("Suspiciously small response from %s for %s — actual content: %r",
+                            candidate.split("::")[0], video_id, resp.content[:500])
 
         converted = await convert_to_telephony_wav(resp.content)
         if converted:
