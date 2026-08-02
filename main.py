@@ -1153,9 +1153,63 @@ async def download_audio_bytes(video_id: str) -> Optional[bytes]:
             logger.warning("Track %s exceeds IVR_MAX_STREAM_BYTES via %s — trying next source",
                             video_id, candidate[:40])
             continue
+        content_type = resp.headers.get("content-type", "unknown")
+        logger.info("✅ Audio download succeeded for %s via %s: %d bytes, content-type=%s",
+                    video_id, candidate.split("::")[0], len(resp.content), content_type)
+        if "audio" not in content_type and "video" not in content_type and "octet-stream" not in content_type:
+            # לא בהכרח קטלני (חלק משרתים לא שולחים content-type נכון), אבל
+            # חשוב לתעד — זה עלול להסביר למה ffmpeg נכשל בהמרה בהמשך.
+            logger.warning("Downloaded content-type for %s doesn't look like audio: %s — might be an error page",
+                            video_id, content_type)
         await cache_set(stream_url_cache, "stream", video_id, target_url, 600)
         return resp.content
 
+    return None
+
+
+async def download_and_convert_telephony_wav(video_id: str) -> Optional[bytes]:
+    """כמו download_audio_bytes, אבל ממשיך למקור הבא גם אם ההורדה 'הצליחה'
+    (200 OK) אך התוכן לא היה אודיו תקין וההמרה ל-WAV נכשלה — למשל אם מקור
+    כלשהו מחזיר דף שגיאה/HTML עם סטטוס 200 בטעות. זה בדיוק התרחיש שראינו:
+    הורדה 'הצליחה' אבל ffmpeg לא הצליח לפענח את מה שירד."""
+    assert http_client is not None
+    cached_url = await cache_get(stream_url_cache, "stream", video_id)
+    candidates = ([f"invidious::{cached_url}"] if cached_url else []) + await _candidate_stream_urls(video_id)
+
+    for candidate in candidates:
+        target_url = await _resolve_candidate(candidate)
+        if not target_url or not target_url.startswith("https://"):
+            continue
+        try:
+            resp = await http_client.get(
+                target_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+                follow_redirects=True,
+            )
+        except (httpx.HTTPError, asyncio.TimeoutError) as e:
+            logger.warning("Audio download failed for %s via %s: %s", video_id, candidate[:40], e)
+            continue
+        if resp.status_code != 200 or len(resp.content) == 0:
+            continue
+        if len(resp.content) > MAX_STREAM_BYTES:
+            logger.warning("Track %s exceeds IVR_MAX_STREAM_BYTES via %s — trying next source",
+                            video_id, candidate[:40])
+            continue
+
+        content_type = resp.headers.get("content-type", "unknown")
+        logger.info("✅ Audio download succeeded for %s via %s: %d bytes, content-type=%s",
+                    video_id, candidate.split("::")[0], len(resp.content), content_type)
+
+        converted = await convert_to_telephony_wav(resp.content)
+        if converted:
+            await cache_set(stream_url_cache, "stream", video_id, target_url, 600)
+            return converted
+
+        logger.warning("Conversion failed for content from %s (video=%s) — trying next source instead of giving up",
+                        candidate.split("::")[0], video_id)
+
+    logger.error("All sources exhausted (download or conversion failed for each) for video=%s", video_id)
     return None
 
 
@@ -1170,6 +1224,12 @@ def _convert_to_telephony_wav_sync(input_bytes: bytes) -> Optional[bytes]:
     if FFMPEG_BIN is None:
         logger.error("Cannot convert audio to WAV — imageio_ffmpeg not installed")
         return None
+    if not input_bytes or len(input_bytes) < 100:
+        # פחות מ-100 בייטים לא יכול להיות קובץ אודיו אמיתי — כנראה הורדנו דף
+        # שגיאה/HTML ריק ממקור שנכשל בשקט. עדיף לתפוס את זה כאן במפורש.
+        logger.error("Input audio is suspiciously small (%d bytes) — likely not real audio, skipping conversion",
+                     len(input_bytes) if input_bytes else 0)
+        return None
     with tempfile.NamedTemporaryFile(suffix=".in", delete=False) as fin:
         fin.write(input_bytes)
         in_path = fin.name
@@ -1180,12 +1240,23 @@ def _convert_to_telephony_wav_sync(input_bytes: bytes) -> Optional[bytes]:
             capture_output=True, timeout=30,
         )
         if result.returncode != 0:
-            logger.error("ffmpeg conversion failed: %s", result.stderr.decode(errors="replace")[:500])
+            # השורות הראשונות של stderr הן תמיד באנר גרסה/build config של
+            # ffmpeg (לא שגיאה) — השגיאה האמיתית כמעט תמיד בסוף. מדפיסים את
+            # שתיהן, אבל את הסוף (עד 1500 תווים אחרונים) כדי שהשגיאה תופיע.
+            stderr_text = result.stderr.decode(errors="replace")
+            logger.error(
+                "ffmpeg conversion failed (input=%d bytes, returncode=%d). Last part of stderr: ...%s",
+                len(input_bytes), result.returncode, stderr_text[-1500:],
+            )
             return None
         with open(out_path, "rb") as f:
-            return f.read()
+            converted = f.read()
+        if len(converted) < 100:
+            logger.error("ffmpeg produced suspiciously small output (%d bytes) despite returncode=0", len(converted))
+            return None
+        return converted
     except (subprocess.TimeoutExpired, OSError) as e:
-        logger.error("ffmpeg conversion error: %s", e)
+        logger.error("ffmpeg conversion error (input=%d bytes): %s", len(input_bytes), e)
         return None
     finally:
         for p in (in_path, out_path):
@@ -1486,9 +1557,9 @@ def _yemot_path_candidates(dest_filename: str) -> List[str]:
     ]
 
 
-async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]:
-    """מעלה קובץ WAV טלפוני תקני לשלוחת ivr2 הייעודית בימות המשיח. מחזיר את
-    הנתיב הפנימי שנקבע, או None אם ההעלאה נכשלה.
+async def _yemot_upload_file(video_id: str, converted_wav_bytes: bytes) -> Optional[str]:
+    """מעלה קובץ WAV טלפוני תקני (כבר מומר!) לשלוחת ivr2 הייעודית בימות
+    המשיח. מחזיר את הנתיב הפנימי שנקבע, או None אם ההעלאה נכשלה.
 
     קריטי #1 (מאומת בפורום): שם קובץ קצר, ספרות בלבד (1000.wav, 002.wav...).
 
@@ -1497,15 +1568,10 @@ async def _yemot_upload_file(video_id: str, audio_bytes: bytes) -> Optional[str]
     - Content-Type של הקובץ ב-multipart חייב להיות 'audio/wav', לא audio/mpeg.
     - פרמטר convertAudio חייב *להיעדר לגמרי* מהבקשה — שליחתו (בכל ערך!)
       גורמת ל-IllegalStateException. משמעות מעשית: ימות *לא* ממיר את
-      הקובץ בעצמו כשהפרמטר נעדר — ולכן אנחנו חייבים לשלוח WAV טלפוני תקני
-      (PCM, 8000Hz, מונו) כבר מוכן, אחרת ההעלאה תצליח (200 OK) אבל השיר לא
-      יישמע נכון/בכלל בשיחה אמיתית. ר' convert_to_telephony_wav.
-    - סכמת הנתיב שעבדה בפועל: 'ivr/<שלוחה>/<קובץ>.wav' (בלי נקודתיים)."""
-    converted = await convert_to_telephony_wav(audio_bytes)
-    if not converted:
-        logger.error("Audio conversion to telephony WAV failed for %s — cannot upload to Yemot", video_id)
-        return None
-
+      הקובץ בעצמו כשהפרמטר נעדר — ולכן ההמרה חייבת לקרות כבר לפני שקוראים
+      לפונקציה הזו (ר' download_and_convert_telephony_wav).
+    - סכמת הנתיב שעבדה בפועל: 'ivr2:/<שלוחה>/<קובץ>.wav'."""
+    converted = converted_wav_bytes
     file_num = await _next_yemot_file_number()
     dest_filename = f"{file_num}.wav"
     is_new_folder = YEMOT_UPLOAD_FOLDER not in _yemot_dirs_ensured
@@ -1681,12 +1747,12 @@ async def ensure_uploaded_to_yemot(video_id: str, session_key: Optional[str] = N
             await _track_session_upload(session_key, video_id)
         return cached[0]
 
-    audio_bytes = await download_audio_bytes(video_id)
-    if not audio_bytes:
-        logger.error("Could not download audio for %s — cannot upload to Yemot", video_id)
+    converted_wav = await download_and_convert_telephony_wav(video_id)
+    if not converted_wav:
+        logger.error("Could not download+convert audio for %s — cannot upload to Yemot", video_id)
         return None
 
-    yemot_path = await _yemot_upload_file(video_id, audio_bytes)
+    yemot_path = await _yemot_upload_file(video_id, converted_wav)
     if not yemot_path:
         return None
 
