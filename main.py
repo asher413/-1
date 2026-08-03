@@ -136,20 +136,11 @@ if not PUBLIC_BASE_URL:
         "מומלץ מאוד להגדיר IVR_PUBLIC_BASE_URL (וגם IVR_REQUIRE_PUBLIC_BASE_URL=true) בפרודקשן."
     )
 
-# תבנית פקודת ה-IVR להפעלת שיר בשיטה הישנה (URL חיצוני) — משמשת רק כ-fallback
-# אם YEMOT_ENABLED=False או אם העלאה לימות נכשלה, למקרה שאתם על פלטפורמה
-# אחרת שכן תומכת ב-URL חיצוני. אם בלוגים אין בקשות ל-/stream/... אחרי שהפקודה
-# חוזרת, זה בגלל שימות המשיח לא תומכת בשיטה הזו כלל (מאומת מול הפורום שלהם) —
-# הפתרון הוא YEMOT_SYSTEM_NUMBER+YEMOT_PASSWORD, לא שינוי בתבנית הזו.
 PLAY_COMMAND_TEMPLATE = os.environ.get(
     "IVR_PLAY_COMMAND_TEMPLATE",
     "read={base}/stream/{video_id}.mp3=ValName,no,1,0,2,digits,no",
 )
 
-# תבנית פקודת ניגון עבור קובץ שכבר הועלה לימות המשיח (נתיב פנימי, לא URL).
-# זו ה"השערה הכי סבירה" לפי תיעוד/דוגמאות קוד מהפורום הרשמי — לא אושרה
-# ב-100% ודאות כי אין תיעוד רשמי חד-משמעי לתחביר הניגון בדיוק (רק להעלאה).
-# מומלץ לבדוק פעם אחת ידנית ולהתאים דרך IVR_YEMOT_PLAY_TEMPLATE אם צריך.
 YEMOT_PLAY_TEMPLATE = os.environ.get(
     "IVR_YEMOT_PLAY_TEMPLATE",
     "read={yemot_path}=ValName,no,1,0,2,digits,no",
@@ -161,23 +152,11 @@ MAX_PLAYLIST_SIZE = int(os.environ.get("IVR_MAX_PLAYLIST_SIZE", "15"))
 SEARCH_RECURSION_DEPTH_LIMIT = 40
 DB_READ_POOL_SIZE = max(1, int(os.environ.get("IVR_DB_READ_POOL_SIZE", "8")))
 
-# הזרמת שמע: ברירת המחדל היא "buffered" — מורידים את כל קובץ ה-mp3 לזיכרון
-# ואז שולחים תשובה רגילה (לא chunked) עם Content-Length מדויק. הרבה מערכות
-# IVR/טלפוניה ישנות (כולל כאלה שמצפות לדעת מראש את גודל הקובץ) לא מפעילות
-# בכלל נגן שמע כשהתשובה מגיעה ב-chunked transfer encoding בלי Content-Length —
-# וזה בדיוק התסמין שראינו: /stream אף פעם לא נקרא בכלל אחרי שהפקודה הוחזרה.
-# STREAM_MODE=passthrough מחזיר לסגנון הישן (הזרמה live, בלי buffer) אם תרצו.
 STREAM_MODE = os.environ.get("IVR_STREAM_MODE", "buffered").lower()
 MAX_STREAM_BYTES = int(os.environ.get("IVR_MAX_STREAM_BYTES", str(30 * 1024 * 1024)))  # 30MB ~ מספיק לשיר ארוך מאוד
 
-# מספרים "חסויים" ששולחות מרכזיות שונות כשהמתקשר חסם הצגת מספר.
 ANONYMOUS_PHONE_VALUES = {"0", "", "anonymous", "unknown", "withheld", "unavailable"}
 
-# --- סליקת תשלומים (אופציונלי) -----------------------------------------
-# אדפטר גנרי ל-REST endpoint של ספק סליקה (Cardcom / Tranzila / Yaad Sarig /
-# PayMe וכו'). כל ספק דורש פורמט קצת שונה — מה שכאן הוא שלד עבודה מלא
-# (רישום עסקה, retry-safe, לוגים, שמירת תוצאה) עם נקודת הרחבה יחידה
-# (charge_customer) שיש להתאים לפי מסמכי ה-API של הספק שבחרתם בפועל.
 CLEARING_API_URL = os.environ.get("CLEARING_API_URL", "")
 CLEARING_TERMINAL = os.environ.get("CLEARING_TERMINAL", "")
 CLEARING_API_KEY = os.environ.get("CLEARING_API_KEY", "")
@@ -190,44 +169,15 @@ if not CLEARING_ENABLED:
         "donation menu option will be disabled."
     )
 
-# --- ימות המשיח: העלאת קובץ מוקדמת (upload-first) --------------------------
-# אושר במפורש בפורום המפתחים הרשמי של ימות המשיח: ניגון ישירות מ-URL חיצוני
-# *אינו נתמך בכלל* — "השמעה בלי להעלות לא אפשרית". חובה להעלות את הקובץ
-# למערכת ימות עם UploadFile ואז לנגן אותו לפי נתיב פנימי. זו הסיבה המדויקת
-# ש-/stream/ מעולם לא נקרא בלוגים שלכם — לא היה שום באג בקוד, הפרוטוקול הזה
-# פשוט לא קיים אצל ימות. בלי YEMOT_SYSTEM_NUMBER+YEMOT_PASSWORD, המערכת
-# ממשיכה לנסות את שיטת ה-URL הישנה (למקרה שאתם על פלטפורמה אחרת בעתיד).
 YEMOT_SYSTEM_NUMBER = os.environ.get("YEMOT_SYSTEM_NUMBER", "")
 YEMOT_PASSWORD = os.environ.get("YEMOT_PASSWORD", "")
-# API_KEY ייעודי (נוצר בפאנל הניהול של ימות, עם הרשאה מפורשת לשירות
-# UploadFile) — אם מוגדר, משמש ישירות כ-token ומדלג לגמרי על Login עם
-# username:password. קריטי לפי תיעוד: החל מנובמבר 2025 ימות עשויה לחסום
-# את שיטת ה-Login המסורתית לפעולות מסוימות (כמו UploadFile) אלא אם הוגדר
-# IP מאושר או נעשה שימוש ב-API_KEY. זה מסביר במדויק תסמין שראינו בפועל:
-# Login ו-UpdateExtension הצליחו, אבל UploadFile ספציפית נכשל שוב ושוב.
 YEMOT_API_KEY = os.environ.get("YEMOT_API_KEY", "")
 YEMOT_ENABLED = bool(YEMOT_API_KEY or (YEMOT_SYSTEM_NUMBER and YEMOT_PASSWORD))
 YEMOT_API_BASE = os.environ.get("YEMOT_API_BASE", "https://www.call2all.co.il/ym/api")
-# נתיב ivr2 להעלאת שירים. לפי תיעוד רשמי של ימות: התחביר הנכון הוא
-# ivr2:<תיקייה>/<קובץ> — בלי לוכסן אחרי הנקודתיים! (ivr2:5/000.wav, לא
-# ivr2:/5/000.wav). בנוסף, תיקיות ב-ivr2 הן בפועל שלוחות (extensions) שצריך
-# ליצור פעם אחת ידנית בפאנל הניהול של ימות (לא ניתן ליצור "תיקייה חדשה בשם
-# חופשי" מה-API בלי שלוחה קיימת מתחתיה) — לכן ברירת המחדל כאן היא מספר
-# שלוחה לדוגמה בלבד; יש להחליף ב-YEMOT_UPLOAD_FOLDER למספר שלוחה אמיתי
-# שיצרתם מראש (למשל "90" אם פתחתם שלוחה 90 ל-mp3 של השירים).
 YEMOT_UPLOAD_FOLDER = os.environ.get("YEMOT_UPLOAD_FOLDER", "90").strip().strip("/")
 if YEMOT_UPLOAD_FOLDER and not YEMOT_UPLOAD_FOLDER.lower().startswith("ivr2:"):
-    # קריטי: הדוגמה האמיתית והמאושרת ('עובד פצצה') מהפורום היא בדיוק
-    # "ivr2:/5/ext.ini" — עם לוכסן מיד אחרי הנקודתיים. מנרמלים לאותו פורמט
-    # בדיוק כדי שלא תצטרכו לזכור את זה בעצמכם.
     YEMOT_UPLOAD_FOLDER = f"ivr2:/{YEMOT_UPLOAD_FOLDER}"
 
-# מחיקה אוטומטית של השיר מימות המשיח ברגע שהמתקשר יוצא מהקו (hangup) —
-# חוסך מקום אחסון בחשבון ימות שלכם, במחיר איבוד קאש חוצה-משתמשים (אם שני
-# מתקשרים שונים מבקשים את אותו שיר, הוא יורד+יועלה מחדש בכל פעם, במקום
-# פעם אחת ולתמיד). ברירת מחדל: מופעל, לפי בקשה מפורשת. אפשר לכבות עם
-# YEMOT_AUTO_DELETE_AFTER_PLAY=false אם עדיפה לכם החיסכון בזמן על פני החיסכון
-# באחסון.
 YEMOT_AUTO_DELETE_AFTER_PLAY = os.environ.get("YEMOT_AUTO_DELETE_AFTER_PLAY", "true").lower() == "true"
 if not YEMOT_ENABLED:
     logger.info(
@@ -239,22 +189,13 @@ elif YEMOT_API_KEY:
     logger.info("Yemot auth: using YEMOT_API_KEY directly (bypasses username:password Login entirely)")
 else:
     logger.info(
-        "Yemot auth: using YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD (Login-based session token). "
-        "If UploadFile keeps failing while Login/UpdateExtension succeed, this may be blocked "
-        "by Yemot's Nov-2025 MFA policy — try setting YEMOT_API_KEY instead."
+        "Yemot auth: using YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD (Login-based session token)."
     )
 YEMOT_RECORDINGS_FOLDER = os.environ.get("YEMOT_RECORDINGS_FOLDER", "ivr2:/ai_recordings").rstrip("/")
 
-# --- זיהוי דיבור בחינם (בלי לשלם לימות המשיח) --------------------------------
-# ימות המשיח גובה כסף על "voice" (זיהוי דיבור מובנה שלהם). האלטרנטיבה: מגדירים
-# את השלוחה במצב "record" (הקלטה גולמית בלבד, ללא זיהוי - ולכן בחינם אצל ימות),
-# מורידים את ההקלטה עם DownloadFile (כבר יש טוקן/Login ממודול ההעלאה למעלה),
-# ומתמללים בעצמנו דרך Groq — יש להם free tier אמיתי ל-Whisper (מהיר, מדויק,
-# בלי צורך במחשוב כבד על השרת שלכם, בניגוד להרצת Whisper מקומי על Render).
-# הרשמה חינמית: https://console.groq.com → API Keys.
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
-STT_ENABLED = bool(GROQ_API_KEY and YEMOT_ENABLED)  # צריך גם Yemot כדי להוריד את ההקלטה עצמה
+STT_ENABLED = bool(GROQ_API_KEY and YEMOT_ENABLED)
 if GROQ_API_KEY and not YEMOT_ENABLED:
     logger.warning(
         "GROQ_API_KEY מוגדר אך YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD חסרים — "
@@ -268,7 +209,6 @@ elif not GROQ_API_KEY:
         "free transcription instead — no cost per search."
     )
 
-# Redis אופציונלי לקאש משותף בין כמה instances. בלי REDIS_URL — TTLCache מקומי.
 REDIS_URL = os.environ.get("REDIS_URL", "")
 _redis = None
 if REDIS_URL:
@@ -287,15 +227,8 @@ PHONE_RE = re.compile(r"^\d{9,15}$")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 AMOUNT_RE = re.compile(r"^\d{1,6}$")
 
-# מפתח ה-API הציבורי שקליינט הווב של יוטיוב שולח בפועל. בלעדיו InnerTube
-# נוטה להחזיר תשובת 200 "ריקה" (בלי תוצאות) במקום שגיאה — בדיוק התופעה
-# שראינו בלוגים. ניתן לדרוס אם יוטיוב ישנה אותו (מפתח ציבורי, לא סוד).
 INNERTUBE_KEY = os.environ.get("IVR_INNERTUBE_KEY", "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8")
 
-# YouTube Data API v3 — הדרך ה*רשמית* לחפש (לא גירוד), הכי אמינה שיש. מכסה
-# חינמית: 10,000 יחידות/יום, וחיפוש אחד עולה 100 יחידות => כ-100 חיפושים/יום
-# בחינם. בלי מפתח, מדלגים לשכבות הגירוד (InnerTube/Invidious/Piped) כמו קודם.
-# מפתח חינמי: Google Cloud Console → Enable "YouTube Data API v3" → Credentials.
 YOUTUBE_DATA_API_KEY = os.environ.get("YOUTUBE_DATA_API_KEY", "")
 YOUTUBE_DATA_API_ENABLED = bool(YOUTUBE_DATA_API_KEY)
 if not YOUTUBE_DATA_API_ENABLED:
@@ -305,21 +238,14 @@ if not YOUTUBE_DATA_API_ENABLED:
         "Setting a free Data API v3 key significantly improves search uptime."
     )
 
-# פרוקסי אופציונלי (למשל Cloudflare Worker) בין השרת ליוטיוב — שימושי אם ה-IP
-# של הפלטפורמה שלכם (Render וכו') חסום/מוגבל ע"י יוטיוב. בלי זה פונים ישירות
-# ל-www.youtube.com. ה-secret נשלח כ-header ולא כחלק מה-URL כדי שלא ידלוף ללוגים.
 YOUTUBE_PROXY_BASE = os.environ.get("IVR_YOUTUBE_PROXY_BASE", "").rstrip("/")
 YOUTUBE_PROXY_SECRET = os.environ.get("IVR_YOUTUBE_PROXY_SECRET", "")
 
-# רשימות שרתי Invidious/Piped ניתנות לעדכון דרך ENV בלי לגעת בקוד — רשימות
-# כאלה "מתות" ומתחלפות כל הזמן, אז חשוב שלא יהיו קשיחות בקוד באופן בלעדי.
 _default_invidious = "https://invidious.projectsegfau.lt,https://yewtu.be,https://invidious.fdn.fr,https://iv.ggtyler.dev"
 _default_piped = "https://pipedapi.kavin.rocks,https://api-piped.mha.fi,https://piped-api.lunar.icu"
 INVIDIOUS_INSTANCES = [i.strip() for i in os.environ.get("IVR_INVIDIOUS_INSTANCES", _default_invidious).split(",") if i.strip()]
 PIPED_INSTANCES = [i.strip() for i in os.environ.get("IVR_PIPED_INSTANCES", _default_piped).split(",") if i.strip()]
 
-# טוקן אופציונלי לחשוף endpoint אבחון לבדיקת חיפוש בלי לחכות לשיחת טלפון.
-# בלי IVR_DEBUG_TOKEN, ה-endpoint מנוטרל לגמרי (404).
 DEBUG_TOKEN = os.environ.get("IVR_DEBUG_TOKEN", "")
 
 search_cache: TTLCache = TTLCache(maxsize=1000, ttl=900)
@@ -346,9 +272,6 @@ async def cache_set(local_cache: TTLCache, namespace: str, key: str, value: str,
             logger.warning("Redis SET failed (%s) — הערך נשמר רק מקומית: %s", namespace, e)
 
 
-# מנעולים פר-טלפון: מונעים מרוץ מצבים בין שתי בקשות מקבילות לאותו מספר.
-# כל הלוגיקה של PLAYING_TRACKS (כולל random.shuffle) רצה בתוך המנעול הזה,
-# כך ששתי בקשות מקבילות לאותו טלפון תמיד מתבצעות בסדר, אף פעם בו-זמנית.
 _phone_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -515,12 +438,6 @@ def init_db() -> None:
         conn.close()
 
 
-# --------------------------------------------------------------------------
-# Connection pool: כתיבות מסתדרות דרך חיבור יחיד + מנעול אחד (SQLite ממילא
-# מרשה כותב יחיד בו-זמנית). קריאות (SELECT) מקבלות פול קטן של חיבורים
-# נפרדים לקונקורנטיות אמיתית, וגם חוסכות פתיחה/סגירה של הקובץ בכל בקשה.
-# להיקף גדול משמעותית (מאות שיחות מקבילות) מומלץ לעבור בעתיד ל-Postgres.
-# --------------------------------------------------------------------------
 _write_conn: Optional[sqlite3.Connection] = None
 _write_lock = asyncio.Lock()
 _read_conns: List[sqlite3.Connection] = []
@@ -574,7 +491,6 @@ async def run_db_query(
         return result
 
     if _write_conn is None or not _read_conns:
-        # פול לא אותחל עדיין (למשל שימוש לפני עליית lifespan) — fallback בטוח.
         def _execute_standalone():
             conn = _open_conn()
             try:
@@ -607,11 +523,9 @@ async def run_db_query(
 
 
 # ==========================================
-# 🚦 Rate Limiting (בלי DELETE בכל בקשה — רק ספירה; הניקוי בטאסק הרקע)
+# 🚦 Rate Limiting
 # ==========================================
 async def is_rate_limited(session_key: str) -> bool:
-    # הוולידציה של phone/anon כבר בוצעה ב-handle_ivr לפני שהגענו לכאן — כאן רק
-    # מוודאים שיש מפתח לא-ריק (יכול להיות "0501234567" או "anon:<call_id>").
     if not session_key:
         return True
     try:
@@ -634,14 +548,13 @@ async def is_rate_limited(session_key: str) -> bool:
         return False
     except Exception as e:
         logger.error("Rate limit check failed: %s", e)
-        return True  # בספק — עדיף לחסום מאשר לפתוח פרצה
+        return True
 
 
 # ==========================================
-# 🔎 חיפוש — InnerTube + regex fallback + Invidious fallback
+# 🔎 חיפוש
 # ==========================================
 def _parse_iso8601_duration(iso: str) -> str:
-    """ממיר משך זמן בפורמט ISO8601 של YouTube ('PT4M13S') לפורמט קריא (4:13)."""
     m = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", iso or "")
     if not m:
         return "00:00"
@@ -722,17 +635,12 @@ _VIDEO_ID_SCAN_RE = re.compile(r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"')
 
 
 def extract_tracks_regex_fallback(raw_text: str) -> List[dict]:
-    """קו הגנה אחרון אם מבנה ה-JSON של InnerTube משתנה ופענוח מובנה נכשל:
-    סריקת regex גולמית לזיהוי videoId בטקסט הגולמי. פחות מדויק (בלי כותרות
-    אמיתיות) אבל עדיף על נפילה מיידית ל-Invidious/פלייליסט חירום."""
     ids = _VIDEO_ID_SCAN_RE.findall(raw_text or "")
     tracks = [{"id": vid, "title": "שיר ללא שם", "duration": "00:00", "author": "אמן"} for vid in ids]
     return _dedupe_and_trim(tracks)
 
 
 async def search_youtube_data_api(query: str, filter_newest: bool = False) -> List[dict]:
-    """שכבה 0: ה-API הרשמי של יוטיוב. לא גירוד — לא שובר כשיוטיוב משנה HTML/JSON
-    פנימי, ולא נחסם לפי IP. המגבלה היחידה היא מכסה יומית (ר' הערה ב-config)."""
     if not YOUTUBE_DATA_API_ENABLED:
         return []
     assert http_client is not None
@@ -783,7 +691,6 @@ async def search_youtube_data_api(query: str, filter_newest: bool = False) -> Li
         if not prelim:
             return []
 
-        # קריאה שנייה (זולה — יחידת quota אחת) כדי לקבל משכי זמן אמיתיים.
         try:
             ids_param = ",".join(t["id"] for t in prelim)
             details_resp = await http_client.get(
@@ -845,8 +752,6 @@ async def search_invidious_fallback(query: str) -> List[dict]:
 
 
 async def search_piped_fallback(query: str) -> List[dict]:
-    """שכבת fallback נוספת (Piped) — פורמט ותוכן instances שונים מ-Invidious,
-    כך ששני השירותים לא נופלים יחד באותו סוג תקלה (שרת מסוים חסום/מת)."""
     assert http_client is not None
     for inst in PIPED_INSTANCES:
         try:
@@ -866,7 +771,7 @@ async def search_piped_fallback(query: str) -> List[dict]:
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                url_path = item.get("url", "")  # e.g. "/watch?v=XXXXXXXXXXX"
+                url_path = item.get("url", "")
                 m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", url_path)
                 if not m:
                     continue
@@ -890,8 +795,6 @@ async def search_piped_fallback(query: str) -> List[dict]:
 
 
 async def _search_via_innertube_scrape(query: str, filter_newest: bool) -> List[dict]:
-    """שכבת גירוד (לא רשמית) של InnerTube — שכבה 1, רק אם ה-Data API הרשמי
-    לא מוגדר/נכשל. עלולה להישבר כשיוטיוב משנה מבנה/מדיניות אנטי-בוט."""
     api_base = YOUTUBE_PROXY_BASE or "https://www.youtube.com"
     url = f"{api_base}/youtubei/v1/search?key={INNERTUBE_KEY}&prettyPrint=false"
     payload = {
@@ -908,7 +811,7 @@ async def _search_via_innertube_scrape(query: str, filter_newest: bool) -> List[
         "query": query,
     }
     if filter_newest:
-        payload["params"] = "EgQIARAB"  # מיון לפי תאריך העלאה
+        payload["params"] = "EgQIARAB"
 
     headers = {
         "Content-Type": "application/json",
@@ -926,8 +829,6 @@ async def _search_via_innertube_scrape(query: str, filter_newest: bool) -> List[
         logger.info("InnerTube status: %s for query: %s (via %s)", resp.status_code, query,
                     "proxy" if YOUTUBE_PROXY_BASE else "direct")
         if resp.status_code != 200:
-            # לוג אבחון מיידי — בלי זה קשה לדעת *למה* השרת דחה (400/403/...)
-            # מבלי לשחזר את הבעיה שוב. 300 תווים מספיקים כדי לזהות סוג שגיאה.
             logger.warning("InnerTube non-200 body preview: %s", resp.text[:300].replace("\n", " "))
             return []
 
@@ -946,17 +847,11 @@ async def _search_via_innertube_scrape(query: str, filter_newest: bool) -> List[
             logger.info("✅ InnerTube parsed successfully: %d tracks", len(tracks))
             return tracks
 
-        # אבחון מורחב: 200 תווים ראשונים כמעט תמיד זה רק "responseContext"/
-        # "visitorData" — לא אינפורמטיבי. מה שכן אינפורמטיבי: אילו מפתחות
-        # top-level קיימים (למשל absence של "contents" = כנראה נחסמנו/קיבלנו
-        # תשובת "עזרה" ולא תוצאות אמיתיות), ו-estimatedResults אם קיים.
         if raw_data is not None and isinstance(raw_data, dict):
             top_keys = list(raw_data.keys())
             estimated = raw_data.get("estimatedResults")
             logger.warning(
-                "InnerTube returned 200 but 0 tracks for query=%r. top_level_keys=%s estimatedResults=%s. "
-                "אם 'contents' לא ברשימה — כנראה תשובת bot-block/consent ולא תוצאות אמיתיות; "
-                "פתרון קבוע לכך הוא YOUTUBE_DATA_API_KEY (שכבה 0 הרשמית) ולא עוד תיקון בגירוד.",
+                "InnerTube returned 200 but 0 tracks for query=%r. top_level_keys=%s estimatedResults=%s.",
                 query, top_keys, estimated,
             )
         else:
@@ -970,13 +865,210 @@ async def _search_via_innertube_scrape(query: str, filter_newest: bool) -> List[
         return []
 
 
+# ==========================================
+# 🆕 yt-dlp — מנוע החיפוש/הורדה החדש (מחליף cobalt/rapidapi/invidious-stream)
+# ==========================================
+# הסיבה שהמערכת לא עבדה בפועל (ר' לוגים): כל שרשרת הורדת האודיו הישנה
+# (cobalt.tools, RapidAPI, Invidious /latest_version) מתה או לא אמינה —
+# ראינו בלוגים DNS שנכשל ל-cobalt, RapidAPI ללא תוצאה, ו-Invidious שמחזיר
+# 22 בייטים של הודעת שגיאה טקסטואלית במקום קובץ אודיו אמיתי. yt-dlp הוא
+# הכלי הפעיל-ביותר-מתוחזק (עדכונים כמעט יומיים) נגד שינויי ההגנות של
+# יוטיוב, ומטפל בעצמו בפענוח החתימות/הצפנה שמקורות ה-scraping הידניים לא
+# מסוגלים לעמוד בהם יותר. משתמשים בו גם לחיפוש (ytsearch) וגם להורדה.
+try:
+    import yt_dlp
+    YTDLP_AVAILABLE = True
+except ImportError:
+    yt_dlp = None
+    YTDLP_AVAILABLE = False
+    logger.warning(
+        "yt-dlp not installed — add 'yt-dlp' to requirements.txt! "
+        "Without it, search and audio download will NOT work — this is now the primary engine."
+    )
+
+# עוגיות אופציונליות (קובץ בפורמט Netscape) — עוזר במקרים של הגבלת גיל/אזור
+# או חסימת בוט אגרסיבית יותר מהרגיל על ה-IP של Render. לא חובה.
+YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "")
+# פרוקסי אופציונלי (http/socks5) אם ה-IP של הפלטפורמה שלכם חסום ע"י יוטיוב.
+YTDLP_PROXY = os.environ.get("YTDLP_PROXY", "")
+# "player client" — לפעמים client=android/ios עוקף חסימות טוב יותר מ-web.
+YTDLP_PLAYER_CLIENT = os.environ.get("YTDLP_PLAYER_CLIENT", "").strip()  # ריק = ברירת מחדל של yt-dlp
+YTDLP_SEARCH_TIMEOUT = float(os.environ.get("YTDLP_SEARCH_TIMEOUT_SEC", "12"))
+YTDLP_DOWNLOAD_TIMEOUT = float(os.environ.get("YTDLP_DOWNLOAD_TIMEOUT_SEC", "45"))
+
+if not YOUTUBE_DATA_API_ENABLED:
+    logger.info("Search engine order: yt-dlp (primary) → emergency playlist (no YOUTUBE_DATA_API_KEY set).")
+
+
+def _ytdlp_base_opts() -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "socket_timeout": 10,
+        "extractor_retries": 1,
+        "ignoreerrors": True,
+        "geo_bypass_country": "IL",
+    }
+    if YTDLP_COOKIES_FILE:
+        opts["cookiefile"] = YTDLP_COOKIES_FILE
+    if YTDLP_PROXY:
+        opts["proxy"] = YTDLP_PROXY
+    if YTDLP_PLAYER_CLIENT:
+        opts["extractor_args"] = {"youtube": {"player_client": [YTDLP_PLAYER_CLIENT]}}
+    if FFMPEG_BIN:
+        opts["ffmpeg_location"] = os.path.dirname(FFMPEG_BIN)
+    return opts
+
+
+def _ytdlp_search_sync(query: str, limit: int, filter_newest: bool) -> List[dict]:
+    """סינכרוני בכוונה — yt-dlp חוסם (I/O+CPU), חובה להריץ ב-executor."""
+    if not YTDLP_AVAILABLE:
+        return []
+    opts = _ytdlp_base_opts()
+    opts["extract_flat"] = "in_playlist"  # בקשה אחת, בלי לפתוח כל וידאו בנפרד => מהיר
+
+    if filter_newest:
+        import urllib.parse
+        q = urllib.parse.quote(query)
+        # sp=CAI%3D == מיון לפי תאריך העלאה בחיפוש הרגיל של יוטיוב
+        target = f"https://www.youtube.com/results?search_query={q}&sp=CAI%3D"
+    else:
+        target = f"ytsearch{max(1, min(limit, 20))}:{query}"
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(target, download=False)
+    except Exception as e:
+        logger.warning("yt-dlp search raised: %s: %s", type(e).__name__, e)
+        return []
+
+    if not info:
+        return []
+    entries = info.get("entries") if isinstance(info, dict) else None
+    if entries is None:
+        entries = [info]
+
+    tracks = []
+    for e in entries:
+        if not e:
+            continue
+        vid = e.get("id")
+        if not vid or not VIDEO_ID_RE.match(vid):
+            continue
+        duration = e.get("duration")
+        if isinstance(duration, (int, float)) and duration >= 0:
+            duration = int(duration)
+            duration_str = f"{duration // 60}:{duration % 60:02d}"
+        else:
+            duration_str = "00:00"
+        tracks.append({
+            "id": vid,
+            "title": e.get("title") or "שיר ללא שם",
+            "author": e.get("channel") or e.get("uploader") or "אמן",
+            "duration": duration_str,
+        })
+        if len(tracks) >= limit:
+            break
+    return tracks
+
+
+async def search_youtube_ytdlp(query: str, filter_newest: bool = False) -> List[dict]:
+    if not YTDLP_AVAILABLE:
+        return []
+    loop = asyncio.get_running_loop()
+    try:
+        tracks = await asyncio.wait_for(
+            loop.run_in_executor(None, _ytdlp_search_sync, query, MAX_PLAYLIST_SIZE, filter_newest),
+            timeout=YTDLP_SEARCH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("yt-dlp search timed out (query=%r)", query)
+        return []
+    tracks = _dedupe_and_trim(tracks)
+    if tracks:
+        logger.info("✅ yt-dlp search success: %d tracks", len(tracks))
+    return tracks
+
+
+def _ytdlp_download_audio_sync(video_id: str) -> Optional[bytes]:
+    """מוריד את ערוץ האודיו הטוב ביותר של הסרטון לקובץ זמני ומחזיר את
+    הבייטים הגולמיים. בכוונה *לא* מבקשים מ-yt-dlp להמיר ל-mp3/wav (אין
+    postprocessor) — ההמרה לפורמט הטלפוני המדויק (PCM 8000Hz מונו) נעשית
+    בנפרד דרך convert_to_telephony_wav, כדי לשמור שכבת אחריות אחת ברורה."""
+    if not YTDLP_AVAILABLE:
+        return None
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with tempfile.TemporaryDirectory(prefix="ytdlp_") as tmpdir:
+        outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+        opts = _ytdlp_base_opts()
+        opts.update({
+            "format": "bestaudio/best",
+            "outtmpl": outtmpl,
+            "skip_download": False,
+            "noprogress": True,
+        })
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info is None:
+                    logger.warning("yt-dlp returned no info for %s (video unavailable/blocked?)", video_id)
+                    return None
+                filename = ydl.prepare_filename(info)
+        except Exception as e:
+            logger.warning("yt-dlp download failed for %s: %s: %s", video_id, type(e).__name__, e)
+            return None
+
+        if not os.path.exists(filename):
+            # לפעמים הסיומת בפועל שונה ממה ש-prepare_filename ניחש (תלוי קודק) —
+            # ניקח כל קובץ שכן נוצר בתיקייה הזמנית.
+            candidates = [f for f in os.listdir(tmpdir) if not f.startswith(".")]
+            if not candidates:
+                logger.error("yt-dlp reported success but no output file exists for %s", video_id)
+                return None
+            filename = os.path.join(tmpdir, candidates[0])
+
+        try:
+            with open(filename, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            logger.error("Failed reading yt-dlp output file for %s: %s", video_id, e)
+            return None
+
+        if len(data) < 1000:
+            logger.error("yt-dlp output suspiciously small (%d bytes) for %s", len(data), video_id)
+            return None
+
+        logger.info("✅ yt-dlp download succeeded for %s: %d bytes", video_id, len(data))
+        return data
+
+
+async def download_audio_via_ytdlp(video_id: str) -> Optional[bytes]:
+    if not YTDLP_AVAILABLE:
+        logger.error("yt-dlp not installed — cannot download audio for %s", video_id)
+        return None
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _ytdlp_download_audio_sync, video_id),
+            timeout=YTDLP_DOWNLOAD_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("yt-dlp download timed out for %s", video_id)
+        return None
+
+
 async def search_youtube_innertube(query: str, filter_newest: bool = False) -> List[dict]:
-    """מנוע החיפוש הראשי — עובר על כל שכבות ההגנה בסדר אמינות יורד:
-    0) YouTube Data API v3 הרשמי (אם מוגדר מפתח) — הכי אמין, לא נשבר.
-    1) גירוד InnerTube (ישיר או דרך פרוקסי) — לא רשמי, יכול להישבר.
-    2) Invidious (כמה instances ציבוריים).
-    3) Piped (כמה instances ציבוריים, סוג תקלה שונה מ-Invidious).
-    4) פלייליסט חירום — כדי שלעולם לא תיתקע שיחה בלי שום שיר.
+    """מנוע החיפוש הראשי — סדר עדכני (2026):
+    0) YouTube Data API v3 הרשמי (אם מוגדר מפתח) — הכי מהיר וזול, לא נשבר,
+       אבל מוגבל למכסה יומית (~100 חיפושים/יום בחינם).
+    1) yt-dlp (ytsearch) — לא צריך מפתח API, מתוחזק באופן פעיל נגד שינויי
+       יוטיוב, ומחליף את כל שכבות ה-scraping הידניות הישנות (InnerTube גולמי,
+       Invidious, Piped) שהפסיקו לעבוד באופן אמין.
+    2) InnerTube/Invidious/Piped — נשארו כרשת ביטחון אחרונה-לפני-חירום, אבל
+       לא מהימנות יותר; ר' לוגים שהראו שהן מתות/חוסמות.
+    3) פלייליסט חירום — כדי שלעולם לא תיתקע שיחה בלי שום שיר.
     כל שכבה שמצליחה נשמרת בקאש (Redis אם מוגדר, אחרת מקומי) ל-15 דקות."""
     query = (query or "").strip()[:150]
     if not query:
@@ -995,8 +1087,14 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
         if tracks:
             await cache_set(search_cache, "search", cache_key, json.dumps(tracks, ensure_ascii=False), 900)
             return tracks
-        logger.info("Data API v3 unavailable/empty → trying InnerTube scrape")
+        logger.info("Data API v3 unavailable/empty → trying yt-dlp search")
 
+    tracks = await search_youtube_ytdlp(query, filter_newest)
+    if tracks:
+        await cache_set(search_cache, "search", cache_key, json.dumps(tracks, ensure_ascii=False), 900)
+        return tracks
+
+    logger.info("yt-dlp search failed/empty → trying legacy InnerTube scrape")
     tracks = await _search_via_innertube_scrape(query, filter_newest)
     if tracks:
         await cache_set(search_cache, "search", cache_key, json.dumps(tracks, ensure_ascii=False), 900)
@@ -1016,78 +1114,17 @@ async def search_youtube_innertube(query: str, filter_newest: bool = False) -> L
 
     logger.error(
         "All search backends failed (query=%r) → serving Emergency playlist. "
-        "אם YOUTUBE_DATA_API_KEY לא מוגדר — זו כנראה הסיבה המרכזית לכשל; "
-        "כל שאר השכבות הן גירוד לא-רשמי שחשוף לחסימות בכל רגע.",
+        "אם גם yt-dlp נכשל, בדקו קודם כל שהחבילה yt-dlp מותקנת ומעודכנת "
+        "(pip install -U yt-dlp) — יוטיוב משנה הגנות לעיתים קרובות והגרסה "
+        "חייבת להיות עדכנית; שקלו גם YTDLP_PROXY אם ה-IP של Render חסום.",
         query,
     )
     return get_emergency_playlist()
 
 
 # ==========================================
-# 🎧 Streaming — עם pre-flight validation לפני שמתחייבים ללקוח
+# 🎧 Streaming — מקור האודיו היחיד כעת הוא yt-dlp (ר' הערה למעלה)
 # ==========================================
-async def _candidate_stream_urls(video_id: str) -> List[str]:
-    candidates: List[str] = []
-    watch_url = f"https://www.youtube.com/watch?v={video_id}"
-
-    for inst in ["https://api.cobalt.tools/api/json", "https://cobalt.api.v0.wtf/api/json"]:
-        candidates.append(f"cobalt::{inst}::{watch_url}")
-
-    if RAPIDAPI_KEY:
-        candidates.append(f"rapidapi::{video_id}")
-
-    # מספר instances של Invidious (לא רק אחד קבוע) — אותה רשימה ניתנת-לעדכון
-    # שמשמשת גם לחיפוש (IVR_INVIDIOUS_INSTANCES), כי כל instance בודד עלול
-    # להיות לא-זמין/להחזיר תשובת שגיאה זעירה (ראינו את זה בפועל בלוגים).
-    for inst in INVIDIOUS_INSTANCES:
-        candidates.append(f"invidious::{inst}/latest_version?id={video_id}&itag=140")
-    return candidates
-
-
-async def _resolve_candidate(candidate: str) -> Optional[str]:
-    assert http_client is not None
-    try:
-        if candidate.startswith("cobalt::"):
-            _, inst, watch_url = candidate.split("::", 2)
-            r = await http_client.post(
-                inst,
-                json={"url": watch_url, "downloadMode": "audio", "audioFormat": "mp3"},
-                timeout=4.0,
-            )
-            if r.status_code == 200:
-                url = r.json().get("url")
-                if url:
-                    return url
-                logger.warning("Cobalt %s returned 200 but no url in response: %s", inst, r.text[:200])
-            else:
-                logger.warning("Cobalt %s returned status %d: %s", inst, r.status_code, r.text[:200])
-
-        elif candidate.startswith("rapidapi::"):
-            video_id = candidate.split("::", 1)[1]
-            r = await http_client.get(
-                f"https://{RAPIDAPI_HOST}/get_mp3_download_link/{video_id}",
-                headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST},
-                timeout=5.0,
-            )
-            if r.status_code == 200:
-                js = r.json()
-                url = js.get("file") or js.get("link") or js.get("url")
-                if url:
-                    return url
-                logger.warning("RapidAPI returned 200 but no file/link/url in response: %s", r.text[:200])
-            else:
-                logger.warning("RapidAPI returned status %d: %s", r.status_code, r.text[:200])
-
-        elif candidate.startswith("invidious::"):
-            return candidate.split("::", 1)[1]
-
-    except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError, ValueError) as e:
-        # str(e) יכול להיות ריק עבור חלק מסוגי החריגות — מוסיפים גם את שם
-        # המחלקה כדי שהלוג תמיד יכיל מידע שימושי, גם כשההודעה עצמה ריקה.
-        logger.warning("Candidate resolve failed (%s): %s: %s", candidate[:60], type(e).__name__, e)
-    return None
-
-
 def _parse_range_header(range_header: Optional[str], total_len: int) -> Optional[Tuple[int, int]]:
     """מפרש 'Range: bytes=START-END' בסיסי. מחזיר (start, end) כולל, או None אם
     אין/לא תקין (ואז שולחים את הקובץ המלא — זה תמיד תקין, גם אם הלקוח ביקש range)."""
@@ -1109,11 +1146,10 @@ def _parse_range_header(range_header: Optional[str], total_len: int) -> Optional
 
 @app.api_route("/stream/{video_id}.mp3", methods=["GET", "HEAD"])
 async def proxy_mp3_stream(video_id: str, request: Request):
-    # לוג בולט ובלתי-ניתן-לפספוס: אם השורה הזו לעולם לא מופיעה בלוג אחרי
-    # שפקודת "read=.../stream/..." הוחזרה למרכזיה, זה מוכיח באופן חד-משמעי
-    # שהמרכזיה בכלל לא ניסתה לפנות לכתובת — כלומר הבעיה היא בהגדרות הפלטפורמה
-    # הטלפונית (חובה לאפשר ניגון קובץ מכתובת אינטרנט בהגדרות השלוחה/מס' מסלול),
-    # ולא באג בקוד הזה.
+    # לוג בולט: אם השורה הזו לעולם לא מופיעה בלוג אחרי שפקודת
+    # "read=.../stream/..." הוחזרה למרכזיה, ההסבר הוא שימות המשיח מעולם לא
+    # תמכה בניגון מ-URL חיצוני (מאומת מול הפורום הרשמי) — לא באג כאן.
+    # /stream משמש היום רק כ-fallback לפלטפורמות אחרות שכן תומכות ב-URL חיצוני.
     client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
     logger.info("🔊 /stream request RECEIVED (%s) for video_id=%s from %s", request.method, video_id, client_ip)
 
@@ -1121,139 +1157,73 @@ async def proxy_mp3_stream(video_id: str, request: Request):
         logger.warning("🔊 /stream rejected: invalid video_id=%r", video_id)
         raise HTTPException(400, "Invalid video ID")
 
-    assert http_client is not None
-    cached_url = await cache_get(stream_url_cache, "stream", video_id)
-    candidates = ([f"invidious::{cached_url}"] if cached_url else []) + await _candidate_stream_urls(video_id)
+    audio_bytes = await download_audio_via_ytdlp(video_id)
+    if not audio_bytes:
+        logger.error("All stream sources exhausted for video_id=%s", video_id)
+        raise HTTPException(502, "No available audio source for this track")
 
-    for candidate in candidates:
-        target_url = await _resolve_candidate(candidate)
-        if not target_url or not target_url.startswith("https://"):
-            continue
+    total_len = len(audio_bytes)
+    base_headers = {
+        "Content-Type": "audio/mpeg",
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store",
+    }
 
-        if STREAM_MODE == "passthrough":
-            result = await _try_passthrough_stream(candidate, target_url, video_id)
-        else:
-            result = await _try_buffered_stream(candidate, target_url, video_id, request)
-        if result is not None:
-            return result
+    if request.method == "HEAD":
+        headers = {**base_headers, "Content-Length": str(total_len)}
+        return Response(status_code=200, headers=headers)
 
-    logger.error("All stream sources exhausted for video_id=%s", video_id)
-    raise HTTPException(502, "No available audio source for this track")
+    range_header = request.headers.get("range")
+    parsed_range = _parse_range_header(range_header, total_len)
+    if parsed_range is not None:
+        start, end = parsed_range
+        chunk = audio_bytes[start:end + 1]
+        headers = {
+            **base_headers,
+            "Content-Length": str(len(chunk)),
+            "Content-Range": f"bytes {start}-{end}/{total_len}",
+        }
+        logger.info("🔊 /stream SUCCESS (206 partial %d-%d/%d) for %s via yt-dlp", start, end, total_len, video_id)
+        return Response(content=chunk, status_code=206, media_type="audio/mpeg", headers=headers)
+
+    headers = {**base_headers, "Content-Length": str(total_len)}
+    logger.info("🔊 /stream SUCCESS (200, %d bytes) for %s via yt-dlp", total_len, video_id)
+    return Response(content=audio_bytes, media_type="audio/mpeg", headers=headers)
 
 
 async def download_audio_bytes(video_id: str) -> Optional[bytes]:
-    """מוריד את קובץ ה-mp3 המלא לזיכרון, מנסה את כל המקורות לפי סדר עדיפות
-    (כמו /stream), אך מחזיר bytes גולמיים במקום Response — משמש גם את /stream
-    וגם את צינור ההעלאה לימות המשיח, כדי לא לשכפל את לוגיקת ה-fallback."""
-    assert http_client is not None
-    cached_url = await cache_get(stream_url_cache, "stream", video_id)
-    candidates = ([f"invidious::{cached_url}"] if cached_url else []) + await _candidate_stream_urls(video_id)
-
-    for candidate in candidates:
-        target_url = await _resolve_candidate(candidate)
-        if not target_url or not target_url.startswith("https://"):
-            continue
-        try:
-            resp = await http_client.get(
-                target_url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
-                follow_redirects=True,
-            )
-        except (httpx.HTTPError, asyncio.TimeoutError) as e:
-            logger.warning("Audio download failed for %s via %s: %s", video_id, candidate[:40], e)
-            continue
-        if resp.status_code != 200 or len(resp.content) == 0:
-            continue
-        if len(resp.content) > MAX_STREAM_BYTES:
-            logger.warning("Track %s exceeds IVR_MAX_STREAM_BYTES via %s — trying next source",
-                            video_id, candidate[:40])
-            continue
-        content_type = resp.headers.get("content-type", "unknown")
-        logger.info("✅ Audio download succeeded for %s via %s: %d bytes, content-type=%s",
-                    video_id, candidate.split("::")[0], len(resp.content), content_type)
-        if "audio" not in content_type and "video" not in content_type and "octet-stream" not in content_type:
-            # לא בהכרח קטלני (חלק משרתים לא שולחים content-type נכון), אבל
-            # חשוב לתעד — זה עלול להסביר למה ffmpeg נכשל בהמרה בהמשך.
-            logger.warning("Downloaded content-type for %s doesn't look like audio: %s — might be an error page",
-                            video_id, content_type)
-        await cache_set(stream_url_cache, "stream", video_id, target_url, 600)
-        return resp.content
-
-    return None
+    """נקודת כניסה יחידה להורדת אודיו גולמי (לא ממומר) — כעת דרך yt-dlp בלבד."""
+    return await download_audio_via_ytdlp(video_id)
 
 
 async def download_and_convert_telephony_wav(video_id: str) -> Optional[bytes]:
-    """כמו download_audio_bytes, אבל ממשיך למקור הבא גם אם ההורדה 'הצליחה'
-    (200 OK) אך התוכן לא היה אודיו תקין וההמרה ל-WAV נכשלה — למשל אם מקור
-    כלשהו מחזיר דף שגיאה/HTML עם סטטוס 200 בטעות. זה בדיוק התרחיש שראינו:
-    הורדה 'הצליחה' אבל ffmpeg לא הצליח לפענח את מה שירד."""
-    assert http_client is not None
-    cached_url = await cache_get(stream_url_cache, "stream", video_id)
-    candidates = ([f"invidious::{cached_url}"] if cached_url else []) + await _candidate_stream_urls(video_id)
-
-    for candidate in candidates:
-        target_url = await _resolve_candidate(candidate)
-        if not target_url or not target_url.startswith("https://"):
-            continue
-        try:
-            resp = await http_client.get(
-                target_url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
-                follow_redirects=True,
-            )
-        except (httpx.HTTPError, asyncio.TimeoutError) as e:
-            logger.warning("Audio download failed for %s via %s: %s", video_id, candidate[:40], e)
-            continue
-        if resp.status_code != 200:
-            logger.warning("Download from %s returned status %d for %s", candidate.split("::")[0],
-                            resp.status_code, video_id)
-            continue
-        if len(resp.content) == 0:
-            logger.warning("Download from %s returned empty body for %s", candidate.split("::")[0], video_id)
-            continue
-        if len(resp.content) > MAX_STREAM_BYTES:
-            logger.warning("Track %s exceeds IVR_MAX_STREAM_BYTES via %s — trying next source",
-                            video_id, candidate[:40])
-            continue
-
-        content_type = resp.headers.get("content-type", "unknown")
-        logger.info("✅ Audio download succeeded for %s via %s: %d bytes, content-type=%s",
-                    video_id, candidate.split("::")[0], len(resp.content), content_type)
-        if len(resp.content) < 1000:
-            # תוכן זעיר עם content-type לא-אודיו הוא כמעט תמיד הודעת שגיאה
-            # טקסטואלית מהמקור (rate limit, video unavailable וכו') — מציגים
-            # אותה במלואה כדי לדעת בדיוק למה, בלי לנחש.
-            logger.warning("Suspiciously small response from %s for %s — actual content: %r",
-                            candidate.split("::")[0], video_id, resp.content[:500])
-
-        converted = await convert_to_telephony_wav(resp.content)
-        if converted:
-            await cache_set(stream_url_cache, "stream", video_id, target_url, 600)
-            return converted
-
-        logger.warning("Conversion failed for content from %s (video=%s) — trying next source instead of giving up",
-                        candidate.split("::")[0], video_id)
-
-    logger.error("All sources exhausted (download or conversion failed for each) for video=%s", video_id)
-    return None
+    """מוריד עם yt-dlp וממיר ל-WAV הטלפוני הנדרש לימות המשיח (PCM 16-bit,
+    8000Hz, מונו). ממשיך להיכשל בבירור (None) אם ההורדה או ההמרה נכשלו,
+    כדי שהקורא (ensure_uploaded_to_yemot) ידע לדווח שגיאה נכונה ולא ינגן
+    שקט/שיבוש בשיחה חיה."""
+    raw = await download_audio_via_ytdlp(video_id)
+    if not raw:
+        return None
+    converted = await convert_to_telephony_wav(raw)
+    if not converted:
+        logger.warning("Conversion failed for yt-dlp audio (video=%s)", video_id)
+        return None
+    return converted
 
 
 def _convert_to_telephony_wav_sync(input_bytes: bytes) -> Optional[bytes]:
-    """ממיר אודיו כלשהו (mp3/webm/וכו') ל-WAV PCM 16-bit, 8000Hz, מונו — פורמט
-    הטלפוניה המדויק שימות המשיח דורשת. פונקציה חוסמת (subprocess) — יש
-    להריץ דרך run_in_executor, לא ישירות בקוד אסינכרוני.
+    """ממיר אודיו כלשהו (מכל קודק שיוטיוב סיפק — webm/opus/m4a/מה שלא יהיה)
+    ל-WAV PCM 16-bit, 8000Hz, מונו — פורמט הטלפוניה המדויק שימות המשיח דורשת.
+    פונקציה חוסמת (subprocess) — יש להריץ דרך run_in_executor.
 
-    קריטי (התגלה אמפירית דרך /debug/yemot): הפרמטר convertAudio של ימות
-    *לא* באמת ממיר את הקובץ בצד שרת — חובה לשלוח WAV תקני כבר מוכן, אחרת
-    ההעלאה 'מצליחה' (200 OK) אבל השיר בפועל לא יישמע נכון/בכלל בשיחה אמיתית."""
+    קריטי (מתועד רשמית ע"י ימות): פרמטר convertAudio="1" של UploadFile *כן*
+    קיים וקביל לפי הדוגמה הרשמית שלהם, אבל אנחנו ממירים כבר בצד שלנו כדי
+    לשלוט באופן מדויק בפורמט (8000Hz מונו) ולא להסתמך על מה שהמרה בצד-שרת
+    עושה בפועל — זה עדיין הכי אמין."""
     if FFMPEG_BIN is None:
         logger.error("Cannot convert audio to WAV — imageio_ffmpeg not installed")
         return None
     if not input_bytes or len(input_bytes) < 100:
-        # פחות מ-100 בייטים לא יכול להיות קובץ אודיו אמיתי — כנראה הורדנו דף
-        # שגיאה/HTML ריק ממקור שנכשל בשקט. עדיף לתפוס את זה כאן במפורש.
         logger.error("Input audio is suspiciously small (%d bytes) — likely not real audio, skipping conversion",
                      len(input_bytes) if input_bytes else 0)
         return None
@@ -1267,9 +1237,6 @@ def _convert_to_telephony_wav_sync(input_bytes: bytes) -> Optional[bytes]:
             capture_output=True, timeout=30,
         )
         if result.returncode != 0:
-            # השורות הראשונות של stderr הן תמיד באנר גרסה/build config של
-            # ffmpeg (לא שגיאה) — השגיאה האמיתית כמעט תמיד בסוף. מדפיסים את
-            # שתיהן, אבל את הסוף (עד 1500 תווים אחרונים) כדי שהשגיאה תופיע.
             stderr_text = result.stderr.decode(errors="replace")
             logger.error(
                 "ffmpeg conversion failed (input=%d bytes, returncode=%d). Last part of stderr: ...%s",
@@ -1295,136 +1262,25 @@ def _convert_to_telephony_wav_sync(input_bytes: bytes) -> Optional[bytes]:
 
 
 async def convert_to_telephony_wav(input_bytes: bytes) -> Optional[bytes]:
-    """עטיפה אסינכרונית ל-_convert_to_telephony_wav_sync — מריצה את ffmpeg
-    (חוסם, CPU-bound) ב-thread pool כדי לא לחסום את ה-event loop."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _convert_to_telephony_wav_sync, input_bytes)
-
-
-async def _try_buffered_stream(candidate: str, target_url: str, video_id: str, request: Request):
-    """מוריד את הקובץ המלא לזיכרון ומחזיר תשובה עם Content-Length מדויק —
-    ברירת המחדל, כי זו הדרך הכי תואמת למגוון הרחב ביותר של פלטפורמות IVR."""
-    assert http_client is not None
-    try:
-        resp = await http_client.get(
-            target_url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
-            follow_redirects=True,
-        )
-    except (httpx.HTTPError, asyncio.TimeoutError) as e:
-        logger.warning("Buffered fetch failed for %s: %s", candidate[:40], e)
-        return None
-
-    if resp.status_code != 200:
-        return None
-
-    body = resp.content
-    if len(body) == 0:
-        logger.warning("Source %s returned 0 bytes for %s — trying next source", candidate[:40], video_id)
-        return None
-    if len(body) > MAX_STREAM_BYTES:
-        logger.warning(
-            "Track %s exceeds IVR_MAX_STREAM_BYTES (%d > %d) — skipping this source",
-            video_id, len(body), MAX_STREAM_BYTES,
-        )
-        return None
-
-    await cache_set(stream_url_cache, "stream", video_id, target_url, 600)
-    total_len = len(body)
-
-    base_headers = {
-        "Content-Type": "audio/mpeg",
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "no-store",
-    }
-
-    range_header = request.headers.get("range")
-    parsed_range = _parse_range_header(range_header, total_len)
-
-    if request.method == "HEAD":
-        headers = {**base_headers, "Content-Length": str(total_len)}
-        logger.info("🔊 /stream HEAD served for %s: %d bytes total", video_id, total_len)
-        return Response(status_code=200, headers=headers)
-
-    if parsed_range is not None:
-        start, end = parsed_range
-        chunk = body[start:end + 1]
-        headers = {
-            **base_headers,
-            "Content-Length": str(len(chunk)),
-            "Content-Range": f"bytes {start}-{end}/{total_len}",
-        }
-        logger.info("🔊 /stream SUCCESS (206 partial %d-%d/%d): serving %s via %s",
-                    start, end, total_len, video_id, candidate.split("::")[0])
-        return Response(content=chunk, status_code=206, media_type="audio/mpeg", headers=headers)
-
-    headers = {**base_headers, "Content-Length": str(total_len)}
-    logger.info("🔊 /stream SUCCESS (200, %d bytes buffered): serving %s via %s",
-                total_len, video_id, candidate.split("::")[0])
-    return Response(content=body, media_type="audio/mpeg", headers=headers)
-
-
-async def _try_passthrough_stream(candidate: str, target_url: str, video_id: str):
-    """הסגנון הישן: הזרמה live בלי buffer מלא — פחות תואם לפלטפורמות IVR
-    ישנות (אין Content-Length), אבל צורך פחות זיכרון וזמן-עד-תגובה-ראשונה
-    קצר יותר. זמין דרך IVR_STREAM_MODE=passthrough למי שיודע שהמערכת שלו תומכת."""
-    assert http_client is not None
-    try:
-        req = http_client.build_request(
-            "GET", target_url,
-            timeout=httpx.Timeout(connect=5.0, read=None, write=10.0, pool=5.0),
-        )
-        resp = await http_client.send(req, stream=True)
-    except (httpx.HTTPError, asyncio.TimeoutError) as e:
-        logger.warning("Passthrough stream failed for %s: %s", candidate[:40], e)
-        return None
-
-    if resp.status_code != 200:
-        await resp.aclose()
-        return None
-
-    await cache_set(stream_url_cache, "stream", video_id, target_url, 600)
-    logger.info("🔊 /stream SUCCESS (passthrough): serving %s via %s", video_id, candidate.split("::")[0])
-
-    byte_counter = {"n": 0}
-
-    async def chunk_generator(response: httpx.Response):
-        try:
-            async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
-                byte_counter["n"] += len(chunk)
-                yield chunk
-        except (httpx.HTTPError, asyncio.TimeoutError) as e:
-            logger.error("Streaming error mid-stream for %s after %d bytes: %s", video_id, byte_counter["n"], e)
-        finally:
-            await response.aclose()
-            logger.info("🔊 /stream ENDED for %s, total bytes sent: %d", video_id, byte_counter["n"])
-
-    return StreamingResponse(chunk_generator(resp), media_type="audio/mpeg")
 
 
 # ==========================================
 # 📤 ימות המשיח: Login + UploadFile (upload-first playback)
 # ==========================================
-# מאומת מול הפורום הרשמי של מפתחי ימות המשיח: ניגון ישירות מ-URL חיצוני *לא
-# נתמך בכלל* על ידי המערכת שלהם — יש להעלות כל קובץ מראש עם UploadFile ואז
-# לנגן אותו לפי נתיב פנימי. זה מסביר באופן מוחלט למה /stream/ מעולם לא נקרא.
+# מאומת מול הפורום הרשמי + התיעוד הרשמי של ימות: ניגון ישירות מ-URL חיצוני
+# *לא נתמך* — יש להעלות כל קובץ מראש עם UploadFile ואז לנגן לפי נתיב פנימי.
+# הנתיב שכן הוכח כעובד בלוגים שלכם בפועל: 'ivr2:/<שלוחה>/<קובץ>.wav'
+# (ר' "🗑️ Yemot file deleted: ivr2:/90/1.wav" בלוג — זה מוכיח שהעלאה קודמת
+# הצליחה ואז נמחקה בהצלחה). כלומר: שכבת ה-Yemot upload כבר עובדת נכון; מה
+# שהיה שבור זה אך ורק הורדת האודיו המקורי מיוטיוב (עכשיו מתוקן ע"י yt-dlp).
 _yemot_token: Optional[str] = None
 _yemot_token_expires_at: Optional[datetime] = None
 _yemot_login_lock = asyncio.Lock()
 
 
 async def _yemot_login(force: bool = False) -> Optional[str]:
-    """מתחבר עם מספר מערכת+סיסמה ומקבל token זמני, עם קאש (ברירת מחדל: מרענן
-    כל 25 דקות ליתר ביטחון, גם אם לא ידוע לנו במדויק כמה זמן token תקף).
-
-    אם הוגדר YEMOT_API_KEY — משתמשים בו ישירות כ-token, בלי לקרוא ל-Login
-    בכלל. זה קריטי כי לפי תיעוד: החל מנובמבר 2025, ימות עשויה לחסום
-    התחברות מסורתית (username:password) לפעולות API מסוימות אלא אם כן
-    הוגדר IP מאושר או שמשתמשים ב-API_KEY ייעודי. זה עשוי להסביר למה Login
-    ו-UpdateExtension הצליחו (אולי לא מוגבלים) בעוד UploadFile ספציפית נכשל
-    (ר' חשוב: ה-API_KEY חייב להיות מוגדר בפאנל הניהול עם הרשאה מפורשת
-    לשירות UploadFile, אחרת גם הוא ידחה)."""
     global _yemot_token, _yemot_token_expires_at
 
     if YEMOT_API_KEY:
@@ -1438,10 +1294,6 @@ async def _yemot_login(force: bool = False) -> Optional[str]:
             return _yemot_token
         try:
             assert http_client is not None
-            # POST עם body במקום GET עם query params — Yemot תומכת בשני
-            # השיטות (מתועד רשמית), אבל GET שם את הסיסמה בתוך ה-URL עצמו,
-            # שמודפס במלואו ע"י httpx/Render/כל פרוקסי בדרך. עם POST הסיסמה
-            # נמצאת ב-body ולא מודפסת בשום מקום.
             resp = await http_client.post(
                 f"{YEMOT_API_BASE}/Login",
                 data={"username": YEMOT_SYSTEM_NUMBER, "password": YEMOT_PASSWORD},
@@ -1450,8 +1302,7 @@ async def _yemot_login(force: bool = False) -> Optional[str]:
             data = resp.json()
             if data.get("responseStatus") != "OK" or not data.get("token"):
                 logger.error(
-                    "Yemot Login failed: %s — אם זה FORBIDDEN/EXCEPTION, ייתכן שזו חסימת "
-                    "ה-MFA של נובמבר 2025. שקלו להגדיר YEMOT_API_KEY במקום.",
+                    "Yemot Login failed: %s — אם זה FORBIDDEN/EXCEPTION, שקלו להגדיר YEMOT_API_KEY במקום.",
                     _safe_json_snippet_early(data),
                 )
                 return None
@@ -1465,8 +1316,6 @@ async def _yemot_login(force: bool = False) -> Optional[str]:
 
 
 def _safe_json_snippet_early(data, limit: int = 500) -> str:
-    """גרסה מוקדמת של _safe_json_snippet (מוגדר שוב במלואו בהמשך הקובץ) —
-    צריך כאן רק כדי לרשום שגיאת Login ללוג בלי לסמוך על סדר הגדרת פונקציות."""
     try:
         s = json.dumps(data, ensure_ascii=False)
     except (TypeError, ValueError):
@@ -1474,17 +1323,10 @@ def _safe_json_snippet_early(data, limit: int = 500) -> str:
     return s[:limit]
 
 
-_yemot_dirs_ensured: set = set()  # קאש בזיכרון - אילו שלוחות ivr2 כבר נוצרו, כדי לא לקרוא UpdateExtension בכל העלאה
+_yemot_dirs_ensured: set = set()
 
 
 async def _yemot_write_ext_ini(folder_path: str, contents: str) -> bool:
-    """כותב את קובץ ext.ini של השלוחה ישירות דרך UploadTextFile — מאומת מול
-    דוגמה אמיתית ומאושרת כעובדת בפורום המפתחים ('עובד פצצה'):
-      UploadTextFile?token=...&what=ivr2:/5/ext.ini&contents=type=...
-    שימו לב לשמות הפרמטרים השונים מ-UploadFile: 'what' (לא 'path') ו-
-    'contents' (לא 'file'). זו כנראה הדרך האמיתית להגדיר type= לשלוחה —
-    ה-type שנשלח כפרמטר ל-UpdateExtension עצמו עלול פשוט להתעלם בשקט,
-    מה שמסביר למה השלוחה 'הצליחה להיווצר' אבל עדיין דחתה העלאות קבצים."""
     token = await _yemot_login()
     if not token:
         return False
@@ -1505,13 +1347,6 @@ async def _yemot_write_ext_ini(folder_path: str, contents: str) -> bool:
 
 
 async def _yemot_ensure_dir(path: str) -> bool:
-    """יוצר שלוחת ivr2 אם היא לא קיימת עדיין, ומגדיר אותה כ-'playfile'
-    (השמעת קבצים) בשתי דרכים במקביל — כי לא ברור אילו מהן ימות "מכבד" בפועל:
-      1. UpdateExtension עם type=playfile כפרמטר (יכול להתעלם בשקט).
-      2. כתיבת ext.ini מפורשת עם 'type=playfile' כשורה ראשונה, דרך
-         UploadTextFile — מאומת כעובד בדוגמה אמיתית מהפורום.
-    מחזיר True אם לפחות אחת הדרכים הצליחה. לא בהכרח שהשלוחה כבר זמינה מיד —
-    ר' ההערה על השהיית הפצה ב-_yemot_upload_file."""
     if path in _yemot_dirs_ensured:
         return True
     token = await _yemot_login()
@@ -1541,11 +1376,6 @@ async def _yemot_ensure_dir(path: str) -> bool:
 
 
 async def _next_yemot_file_number() -> int:
-    """מספר רץ קצר (1, 2, 3...) לשמות קבצים בימות — לא timestamp. כל הדוגמאות
-    האמיתיות שמצאנו בפורום המפתחים (1000.wav, 002.wav, M1101.wav) הן קצרות;
-    יתכן שזה בדיוק מה שחסר גם אחרי שהפכנו לספרות בלבד — 13 ספרות של
-    timestamp עדיין עלולות להידחות כ'לא תקין' אם יש טווח ערכים סביר מצופה.
-    נשמר ב-DB (עולה תמיד, לעולם לא מתאפס) כדי שלא יהיה סיכוי להתנגשות שמות."""
     row = await run_db_query("SELECT next_num FROM yemot_file_counter WHERE id = 1")
     num = row[0] if row else 1
     await run_db_query(
@@ -1557,7 +1387,6 @@ async def _next_yemot_file_number() -> int:
 
 
 def _bare_yemot_extension() -> str:
-    """מחלץ את מספר השלוחה הגולמי מ-YEMOT_UPLOAD_FOLDER (מסיר קידומת ivr2: אם יש)."""
     folder = YEMOT_UPLOAD_FOLDER
     if folder.lower().startswith("ivr2:"):
         folder = folder[5:]
@@ -1565,39 +1394,19 @@ def _bare_yemot_extension() -> str:
 
 
 def _yemot_path_candidates(dest_filename: str) -> List[str]:
-    """בונה רשימת נתיבים מועמדים בכמה סכמות כתובות שונות.
-
-    תיקון חשוב: אומת אמפירית (דרך /debug/yemot) שהנתיב שבאמת *נשלח* בבקשה
-    המוצלחת היה 'ivr2:/<שלוחה>/<קובץ>' (עם נקודתיים!) — לא 'ivr/<שלוחה>/...'.
-    ה-'ivr/90/1.wav' שחזר ב-response הוא רק השם הקנוני *הפנימי* שימות
-    מדווח בתשובה, לא מה ששלחנו. הבלבול הזה גרם לתיקון שגוי בסבב קודם (שסידר
-    את הסכמות בסדר הפוך) — עכשיו מתוקן חזרה: 'ivr2:' (עם השהיה בהתאם
-    ל-YEMOT_UPLOAD_FOLDER המנורמל) הוא הראשון, כי זה מה שבאמת עבד. הגורם
-    האמיתי לתיקון לא היה סכמת הנתיב בכלל — היה היעדר convertAudio +
-    Content-Type=audio/wav (ר' _yemot_upload_file)."""
+    """נתיב ראשון ברשימה הוא הפורמט המאומת-עובד בפועל (מוכח מהלוגים שלכם:
+    'ivr2:/90/1.wav' הועלה ונמחק בהצלחה) — גם תואם לדוגמת הקוד הרשמית של
+    ימות (UploadFile: path=`ivr2:/${path}.wav`). האחרים הם רשת ביטחון בלבד."""
     ext_num = _bare_yemot_extension()
     return [
-        f"{YEMOT_UPLOAD_FOLDER}/{dest_filename}",           # מאומת כעובד בפועל (ivr2:/90/...) — ראשון בכוונה
-        f"ivr/{ext_num}/{dest_filename}",                   # fallback: סכמה ישנה, 2 רמות
-        f"ivr/{ext_num}/1/{dest_filename}",                 # fallback: סכמה ישנה, 3 רמות
-        f"ivr/1/{ext_num}/{dest_filename}",                 # fallback: סדר הפוך
+        f"{YEMOT_UPLOAD_FOLDER}/{dest_filename}",
+        f"ivr/{ext_num}/{dest_filename}",
+        f"ivr/{ext_num}/1/{dest_filename}",
+        f"ivr/1/{ext_num}/{dest_filename}",
     ]
 
 
 async def _yemot_upload_file(video_id: str, converted_wav_bytes: bytes) -> Optional[str]:
-    """מעלה קובץ WAV טלפוני תקני (כבר מומר!) לשלוחת ivr2 הייעודית בימות
-    המשיח. מחזיר את הנתיב הפנימי שנקבע, או None אם ההעלאה נכשלה.
-
-    קריטי #1 (מאומת בפורום): שם קובץ קצר, ספרות בלבד (1000.wav, 002.wav...).
-
-    קריטי #2 (מאומת אמפירית דרך /debug/yemot עם בדיקת כל הקומבינציות):
-    - הנתיב (path) חייב סיומת .wav.
-    - Content-Type של הקובץ ב-multipart חייב להיות 'audio/wav', לא audio/mpeg.
-    - פרמטר convertAudio חייב *להיעדר לגמרי* מהבקשה — שליחתו (בכל ערך!)
-      גורמת ל-IllegalStateException. משמעות מעשית: ימות *לא* ממיר את
-      הקובץ בעצמו כשהפרמטר נעדר — ולכן ההמרה חייבת לקרות כבר לפני שקוראים
-      לפונקציה הזו (ר' download_and_convert_telephony_wav).
-    - סכמת הנתיב שעבדה בפועל: 'ivr2:/<שלוחה>/<קובץ>.wav'."""
     converted = converted_wav_bytes
     file_num = await _next_yemot_file_number()
     dest_filename = f"{file_num}.wav"
@@ -1608,8 +1417,6 @@ async def _yemot_upload_file(video_id: str, converted_wav_bytes: bytes) -> Optio
 
     async def _do_upload(token: str, path: str) -> httpx.Response:
         assert http_client is not None
-        # convertAudio במפורש *לא* בפרמטרים — ר' הערה למעלה. שליחתו (בכל
-        # ערך) גורמת ל-IllegalStateException אצל ימות, מאומת אמפירית.
         return await http_client.post(
             f"{YEMOT_API_BASE}/UploadFile",
             data={"token": token, "path": path},
@@ -1631,9 +1438,6 @@ async def _yemot_upload_file(video_id: str, converted_wav_bytes: bytes) -> Optio
             continue
 
         if data.get("responseStatus") == "OK":
-            # ימות עשוי להחזיר את הנתיב הקנוני שלו ב-response (ראינו בפועל
-            # "path": "ivr/90/1.wav") — עדיף להשתמש בו אם קיים, כדי שפקודת
-            # הניגון תפנה בדיוק למה שימות בעצמו מכיר, לא רק למה שביקשנו.
             canonical_path = data.get("path") or candidate_path
             logger.info("✅ Yemot UploadFile success for %s → %s (scheme %d/%d)",
                         video_id, canonical_path, i + 1, len(candidates))
@@ -1647,8 +1451,6 @@ async def _yemot_upload_file(video_id: str, converted_wav_bytes: bytes) -> Optio
                     len(candidates), video_id, _safe_json_snippet_early(last_error_data))
 
     if is_new_folder:
-        # שלוחה חדשה שכנראה עדיין לא הופצה — ממשיכים לנסות ברקע (בלי לעכב
-        # את התשובה הנוכחית למרכזיה), כדי שהבקשה הבאה תעבוד חלק.
         logger.info("🕒 Starting background warm-up retry for new Yemot folder %s (up to ~2 min)",
                     YEMOT_UPLOAD_FOLDER)
         asyncio.create_task(_yemot_upload_warmup(video_id, converted, dest_filename))
@@ -1657,12 +1459,6 @@ async def _yemot_upload_file(video_id: str, converted_wav_bytes: bytes) -> Optio
 
 
 async def _yemot_upload_warmup(video_id: str, converted_wav_bytes: bytes, dest_filename: str) -> None:
-    """ריצה ברקע בלבד (לא במסגרת שיחה חיה): ממשיכה לנסות להעלות — עם כל
-    סכמות הנתיב (ר' _yemot_path_candidates) — עם השהיות גדלות, עד שהשלוחה
-    מופצת בימות (עד כ-2 דקות לפי דיווחים בפורום) או שאחת הסכמות מצליחה.
-    שומרת ל-DB אם וכשמצליחה — כדי שבקשות עתידיות ימצאו אותה בקאש מיד.
-    מקבלת bytes שכבר הומרו ל-WAV טלפוני (לא mp3 גולמי) — ר' הערה ב-_yemot_upload_file
-    לגבי למה convertAudio לא באמת עושה את ההמרה בצד ימות."""
     candidates = _yemot_path_candidates(dest_filename)
     for delay in (10, 20, 30, 45):
         await asyncio.sleep(delay)
@@ -1673,8 +1469,6 @@ async def _yemot_upload_warmup(video_id: str, converted_wav_bytes: bytes, dest_f
         for candidate_path in candidates:
             try:
                 assert http_client is not None
-                # אין convertAudio בפרמטרים בכלל — שליחתו (בכל ערך) גורמת
-                # ל-IllegalStateException, מאומת אמפירית דרך /debug/yemot.
                 resp = await http_client.post(
                     f"{YEMOT_API_BASE}/UploadFile",
                     data={"token": token, "path": candidate_path},
@@ -1688,8 +1482,7 @@ async def _yemot_upload_warmup(video_id: str, converted_wav_bytes: bytes, dest_f
 
             if data.get("responseStatus") == "OK":
                 canonical_path = data.get("path") or candidate_path
-                logger.info("✅ Yemot warm-up upload succeeded for %s → %s — folder is ready for future requests",
-                            video_id, canonical_path)
+                logger.info("✅ Yemot warm-up upload succeeded for %s → %s", video_id, canonical_path)
                 await run_db_query(
                     "INSERT OR REPLACE INTO yemot_uploads (video_id, yemot_path, uploaded_at) VALUES (?, ?, ?)",
                     (video_id, canonical_path, utcnow().isoformat()),
@@ -1700,16 +1493,12 @@ async def _yemot_upload_warmup(video_id: str, converted_wav_bytes: bytes, dest_f
                             candidate_path, _safe_json_snippet_early(data))
 
     logger.error(
-        "Yemot warm-up gave up after ~105s for folder %s (tried %d path schemes each round) — "
-        "the path format is very likely still wrong, not just a propagation delay. "
-        "Use /debug/yemot with target_ext to find the correct one.",
+        "Yemot warm-up gave up after ~105s for folder %s (tried %d path schemes each round).",
         YEMOT_UPLOAD_FOLDER, len(candidates),
     )
 
 
 async def _yemot_delete_file(path: str) -> bool:
-    """מוחק קובץ מהאחסון של ימות המשיח. מאומת מול הפורום הרשמי:
-    FileAction?token=...&action=delete&what=<path>"""
     token = await _yemot_login()
     if not token:
         return False
@@ -1733,8 +1522,6 @@ async def _yemot_delete_file(path: str) -> bool:
 
 
 async def _track_session_upload(session_key: str, video_id: str) -> None:
-    """רושם ש-video_id הועלה לימות במהלך השיחה של session_key, כדי שנוכל
-    למחוק אותו אוטומטית כשהמתקשר יתנתק (ר' cleanup_session_uploads)."""
     await run_db_query(
         "INSERT OR IGNORE INTO session_uploads (session_key, video_id) VALUES (?, ?)",
         (session_key, video_id), commit=True,
@@ -1742,9 +1529,6 @@ async def _track_session_upload(session_key: str, video_id: str) -> None:
 
 
 async def cleanup_session_uploads(session_key: str) -> None:
-    """נקרא ב-hangup: מוחק מימות את כל השירים שהועלו במהלך השיחה הזו, ומנקה
-    גם את קאש ה-DB שלנו (yemot_uploads) כדי שהפעם הבאה תוריד ותעלה מחדש —
-    זה בדיוק הטרייד-אוף שביקשתם: פחות אחסון תפוס, יותר קריאות API בכל ניגון."""
     if not YEMOT_ENABLED or not YEMOT_AUTO_DELETE_AFTER_PLAY:
         return
     rows = await run_db_query(
@@ -1762,9 +1546,6 @@ async def cleanup_session_uploads(session_key: str) -> None:
 
 
 async def ensure_uploaded_to_yemot(video_id: str, session_key: Optional[str] = None) -> Optional[str]:
-    """נקודת הכניסה היחידה שצריך לקרוא לפני ניגון: מחזיר נתיב קובץ בימות
-    (מהקאש/DB אם כבר הועלה בעבר, אחרת מוריד מיוטיוב ומעלה עכשיו). אם
-    session_key סופק ומחיקה-אוטומטית מופעלת, רושמים אותו למחיקה בסוף השיחה."""
     if not YEMOT_ENABLED:
         return None
 
@@ -1794,8 +1575,6 @@ async def ensure_uploaded_to_yemot(video_id: str, session_key: Optional[str] = N
 
 
 async def yemot_download_file(path: str) -> Optional[bytes]:
-    """מוריד קובץ (כמו הקלטה גולמית) מהאחסון של ימות המשיח, לפי הנתיב שחוזר
-    ב-ValName אחרי read מסוג record. משתמש באותו token/login של ה-upload."""
     if not YEMOT_ENABLED:
         return None
     token = await _yemot_login()
@@ -1818,8 +1597,6 @@ async def yemot_download_file(path: str) -> Optional[bytes]:
 
 
 def _looks_like_yemot_path(value: str) -> bool:
-    """היוריסטיקה לזיהוי אם ValName הוא נתיב קובץ בימות (אחרי הקלטה) ולא
-    טקסט חופשי/ספרות: לפי תחיליות/סיומות טיפוסיות של מערכת הקבצים שלהם."""
     if not value:
         return False
     v = value.strip().lower()
@@ -1830,10 +1607,6 @@ def _looks_like_yemot_path(value: str) -> bool:
 
 
 async def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.wav") -> Optional[str]:
-    """מתמלל הקלטה קולית בעברית דרך Groq (Whisper) — יש להם free tier אמיתי,
-    בלי לשלם על כל חיפוש כמו ב-voice המובנה של ימות. לא נבדק אמפירית מהסביבה
-    הזו (groq.com לא בטווח הרשת של ה-sandbox), אבל עוקב אחרי ה-API המתועד
-    שלהם (תואם-OpenAI: POST /openai/v1/audio/transcriptions, multipart)."""
     if not GROQ_API_KEY:
         return None
     try:
@@ -1856,11 +1629,6 @@ async def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.
 
 
 async def resolve_search_query_from_valname(val_name: str) -> Optional[str]:
-    """נקודת הכניסה היחידה לפענוח מה שחזר מהשלוחה של 'אמרו שם שיר':
-    - אם STT_ENABLED והערך נראה כמו נתיב קובץ בימות (מצב record חינמי) —
-      מורידים את ההקלטה ומתמללים בעצמנו דרך Groq.
-    - אחרת (או אם התמלול נכשל) — מניחים שזה כבר טקסט מזוהה (מצב voice
-      המובנה בתשלום של ימות, או פלטפורמה אחרת), ומשתמשים בו כמות שהוא."""
     if STT_ENABLED and _looks_like_yemot_path(val_name):
         audio_bytes = await yemot_download_file(val_name.strip())
         if not audio_bytes:
@@ -1880,8 +1648,6 @@ async def resolve_search_query_from_valname(val_name: str) -> Optional[str]:
 # 💳 סליקת תשלומים (אופציונלי)
 # ==========================================
 def _safe_json_snippet(data, limit: int = 2000) -> str:
-    """שומר תמיד JSON תקין (אף פעם לא נחתך באמצע), גם כשהתשובה מהספק ענקית —
-    כדי שקריאה עתידית עם json.loads() לא תיפול."""
     try:
         full = json.dumps(data, ensure_ascii=False)
     except (TypeError, ValueError):
@@ -1892,13 +1658,6 @@ def _safe_json_snippet(data, limit: int = 2000) -> str:
 
 
 async def charge_customer(phone: str, amount_ils: float) -> Tuple[bool, str, str]:
-    """
-    מבצע חיוב מול ספק הסליקה שהוגדר ב-ENV. זהו אדפטר גנרי ל-REST endpoint —
-    התאימו את שדות הבקשה/תשובה למסמכי ה-API של הספק שלכם בפועל
-    (Cardcom / Tranzila / Yaad Sarig / PayMe...). כל מה שסביב (רישום עסקה,
-    לוגים, טיפול בשגיאות) כבר מוכן ולא צריך לגעת בו.
-    מחזיר: (success, message_for_caller, tx_id)
-    """
     tx_id = secrets.token_hex(8)
     if not CLEARING_ENABLED:
         return False, "שירות התשלומים אינו זמין כרגע", tx_id
@@ -1950,9 +1709,6 @@ async def charge_customer(phone: str, amount_ils: float) -> Tuple[bool, str, str
 
 @app.post("/payment/webhook")
 async def payment_webhook(request: Request):
-    """נקודת קצה אופציונלית לאישורי תשלום א-סינכרוניים מספק הסליקה (אם הוא
-    תומך ב-webhook/IPN). מגן בסיסי: דורש שיתאים tx_id קיים בטבלה. הוסיפו כאן
-    אימות חתימה/סוד משותף לפי מסמכי הספק שלכם לפני production אמיתי."""
     try:
         payload = await request.json()
     except json.JSONDecodeError:
@@ -1991,24 +1747,15 @@ def make_ivr_read_command(text: str, min_dig: str, max_dig: str, sec: int, mode:
 
 
 def make_ivr_record_command(text: str, max_seconds: int) -> str:
-    """מקליטה גולמית בלי זיהוי דיבור (record) — בחינם אצל ימות המשיח, בניגוד
-    ל-voice (שגובה כסף). לפי אישור מפורש בפורום המפתחים של ימות: כשמסתיימת
-    הקלטה, הנתיב שבו היא נשמרה חוזר ב-ValName בבקשה הבאה, ולא התמלול עצמו —
-    אנחנו מורידים את הקובץ עם DownloadFile ומתמללים בעצמנו (ר' STT_ENABLED)."""
     clean = clean_text_for_ivr(text)
     return f"read=t-{clean}=ValName,no,,,{max_seconds},record,no"
 
 
 def _get_url_based_play_command(video_id: str, request: Request) -> Optional[str]:
-    """השיטה הישנה: מחזירים URL חיצוני שהמרכזיה אמורה להביא בעצמה. מאומת
-    שימות המשיח *לא* תומכת בזה בכלל — זו רק שכבת fallback/תאימות לפלטפורמות
-    אחרות, או למקרה ש-YEMOT_ENABLED=False."""
     if PUBLIC_BASE_URL:
         base = PUBLIC_BASE_URL
     else:
         raw_host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
-        # מאחורי כמה פרוקסים בשרשרת (למשל Cloudflare + Render) הכותרת עלולה
-        # להכיל כמה ערכים מופרדים בפסיק ("host1, host2") — הראשון הוא המקורי.
         host = raw_host.split(",")[0].strip().split(":")[0].lower()
         if TRUSTED_HOSTS and host not in TRUSTED_HOSTS:
             logger.error("Rejected untrusted Host header for play command: %r", host)
@@ -2024,11 +1771,6 @@ def _generic_error_command() -> str:
 
 
 async def _play_command_or_error(video_id: str, request: Request, session_key: Optional[str] = None) -> str:
-    """נקודת הכניסה היחידה לבניית פקודת ניגון: אם ימות מוגדר, מעלים קודם
-    (או משתמשים בהעלאה קיימת) ומנגנים לפי נתיב פנימי — השיטה היחידה שבאמת
-    עובדת בימות המשיח. אם ימות לא מוגדר, או שההעלאה נכשלה, נופלים חזרה
-    לשיטת ה-URL הישנה (במקום פשוט להיכשל). session_key משמש למחיקה אוטומטית
-    של השיר מימות ברגע שהמתקשר הזה מנתק את השיחה."""
     if YEMOT_ENABLED:
         yemot_path = await ensure_uploaded_to_yemot(video_id, session_key)
         if yemot_path:
@@ -2068,13 +1810,11 @@ async def active_session_cleanup():
 
 
 async def _cleanup_supervisor():
-    """עוטף את משימת הניקוי ומרים אותה מחדש אם היא קורסת מסיבה בלתי צפויה,
-    כדי שלעולם לא "נשכח" עם sessions/rate_limits שהולכים ותופחים."""
     backoff = 5
     while True:
         try:
             await active_session_cleanup()
-            return  # לא אמור לקרות (לולאה אינסופית), אבל ליתר ביטחון
+            return
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -2101,9 +1841,6 @@ MAIN_MENU_TEXT = (
 
 
 async def _save_session(phone: str, state: str, playlist: List[dict], index: int) -> None:
-    """כותב state + playlist_json + current_index יחד, תמיד באותה קריאה —
-    כדי שה-DB וה-RAM לעולם לא יתפצלו לגרסאות לא-מסונכרנות (state ישן מול
-    פלייליסט חדש וכד')."""
     await run_db_query(
         "UPDATE sessions SET state = ?, playlist_json = ?, current_index = ? WHERE phone = ?",
         (state, json.dumps(playlist, ensure_ascii=False), index, phone),
@@ -2137,15 +1874,11 @@ async def _load_or_create_session(phone: str, is_whitelisted: bool) -> Tuple[str
 # ==========================================
 @app.api_route("/youtube", methods=["GET", "POST"], response_class=PlainTextResponse)
 async def handle_ivr(request: Request):
-    # ימות המשיח עשויה לשלוח GET או POST לשלוחת ה-API (תלוי בהגדרות השלוחה
-    # אצלכם) — תומכים בשניהם כדי לא לקבל 405 Method Not Allowed. הפרמטרים
-    # יכולים להגיע ב-query string וגם/או ב-body (form-urlencoded) גם כש-
-    # המתודה POST, אז ממזגים את שני המקורות.
     all_items = list(request.query_params.multi_items())
     if request.method == "POST":
         try:
             content_type = request.headers.get("content-type", "")
-            if "form" in content_type:  # x-www-form-urlencoded או multipart/form-data
+            if "form" in content_type:
                 form = await request.form()
                 all_items.extend(form.multi_items())
         except Exception as e:
@@ -2165,10 +1898,6 @@ async def handle_ivr(request: Request):
     is_anonymous = raw_phone.lower() in ANONYMOUS_PHONE_VALUES
 
     if is_anonymous:
-        # מתקשר עם מספר חסום. אי אפשר לזהות אותו לאורך זמן (וגם לא כדאי —
-        # אין למה "לזכור"), אבל חובה לתת לו session_key ייחודי לשיחה הנוכחית
-        # (ApiCallId/ApiYFCallId) ולא "0" קבוע — אחרת כל המתקשרים החסויים
-        # היו חולקים session אחד וקופצים על הפלייליסט/מצב אחד של השני.
         call_id = (_get_last("ApiCallId") or _get_last("ApiYFCallId") or "").strip()
         if not call_id:
             logger.warning("Anonymous caller with no call id — rejecting")
@@ -2181,8 +1910,6 @@ async def handle_ivr(request: Request):
         session_key = raw_phone
 
     if hangup == "yes":
-        # המתקשר יצא מהקו — אם הוגדר מחיקה אוטומטית אחרי השמעה, מוחקים עכשיו
-        # מימות המשיח את כל השירים שהועלו במהלך השיחה הזו (שחרור מקום אחסון).
         if YEMOT_AUTO_DELETE_AFTER_PLAY:
             asyncio.create_task(cleanup_session_uploads(session_key))
         return "OK"
@@ -2204,8 +1931,6 @@ async def handle_ivr(request: Request):
         logger.exception("Unhandled error in IVR handler for session=%s: %s", session_key, e)
         result = _generic_error_command()
 
-    # לוג מלא של הפקודה שמוחזרת למרכזיה — כך אפשר לראות בדיוק אילו תווים
-    # קיבלה ימות המשיח, ולוודא שהפורמט תואם למה שאתם מריצים ידנית בבדיקות.
     logger.info("📤 Returning to IVR (session=%s): %s", session_key, result)
     return result
 
@@ -2214,8 +1939,6 @@ async def _handle_ivr_locked(
     request: Request, ApiPhone: str, ValName: Optional[str], is_anonymous: bool = False
 ) -> str:
     if is_anonymous:
-        # אין ל-caller חסוי זהות יציבה שאפשר לשמור/לאשר לצמיתות — תמיד דורשים
-        # קוד גישה, ולעולם לא כותבים אותו לטבלת users (שם היא לא בעלת משמעות).
         is_whitelisted = False
         stored_access_code = DEFAULT_ACCESS_CODE
     else:
@@ -2229,7 +1952,6 @@ async def _handle_ivr_locked(
         "UPDATE sessions SET last_active = ? WHERE phone = ?", (utcnow().isoformat(), ApiPhone), commit=True
     )
 
-    # ---------- Auth flow ----------
     if not is_whitelisted and state == State.CHECK_AUTH.value:
         if ValName and ValName == stored_access_code:
             if not is_anonymous:
@@ -2245,14 +1967,10 @@ async def _handle_ivr_locked(
             msg = "קוד שגוי אנא נסה שנית" if ValName else "אנא הקש את קוד הגישה"
             return make_ivr_read_command(msg, "4", "4", 10, "digits")
 
-    # ---------- MAIN MENU ----------
     if state == State.MAIN_MENU.value:
         if ValName == "1":
             await _save_session(ApiPhone, State.WAITING_FOR_SEARCH.value, [], 0)
             if STT_ENABLED:
-                # מצב הקלטה חינמי (record) — בלי voice בתשלום של ימות. תמלול
-                # עצמי דרך Groq קורה בשלב הבא (WAITING_FOR_SEARCH) לפי הנתיב
-                # שיחזור ב-ValName.
                 return make_ivr_record_command("אנא אמרו את שם השיר לאחר הצליל", max_seconds=10)
             return make_ivr_read_command("אנא אמרו את שם השיר לאחר הצליל", "1", "50", 10, "voice")
 
@@ -2284,7 +2002,6 @@ async def _handle_ivr_locked(
         else:
             return make_ivr_read_command(MAIN_MENU_TEXT, "1", "1", 10, "digits")
 
-    # ---------- SEARCH ----------
     elif state == State.WAITING_FOR_SEARCH.value:
         if not ValName or len(ValName) < 2 or ValName in ("1", "2", "*", "#"):
             retry_cmd = (
@@ -2296,8 +2013,6 @@ async def _handle_ivr_locked(
 
         query = await resolve_search_query_from_valname(ValName)
         if not query:
-            # התמלול נכשל (למשל לא הצלחנו להוריד/לתמלל את ההקלטה) — לא נתקע
-            # את המתקשר, פשוט מבקשים ניסיון נוסף באותה שיטה.
             retry_cmd = (
                 make_ivr_record_command("לא הצלחתי להבין, אנא נסו שוב", max_seconds=10)
                 if STT_ENABLED else
@@ -2312,7 +2027,6 @@ async def _handle_ivr_locked(
         await _save_session(ApiPhone, State.PLAYING_TRACKS.value, tracks, 0)
         return await _play_command_or_error(tracks[0]["id"], request, ApiPhone)
 
-    # ---------- DONATION AMOUNT ----------
     elif state == State.WAITING_FOR_DONATION_AMOUNT.value:
         if not ValName or not AMOUNT_RE.match(ValName):
             return make_ivr_read_command("סכום לא תקין, אנא הקישו שוב מספר בשקלים", "1", "6", 10, "digits")
@@ -2329,7 +2043,6 @@ async def _handle_ivr_locked(
         await _save_session(ApiPhone, State.MAIN_MENU.value, [], 0)
         return make_ivr_read_command(message, "1", "1", 6, "digits")
 
-    # ---------- PLAYING ----------
     elif state == State.PLAYING_TRACKS.value:
         if not playlist:
             playlist = get_emergency_playlist()
@@ -2341,7 +2054,6 @@ async def _handle_ivr_locked(
         if ValName == "2":
             index = (index - 1) % total
         elif ValName == "3":
-            # משהים: לא כותבים ל-DB (אין שינוי state/playlist/index אמיתי)
             return make_ivr_read_command("הושהה • להמשך 4 • תפריט 0", "1", "1", 20, "digits")
         elif ValName == "5":
             random.shuffle(playlist)
@@ -2353,35 +2065,29 @@ async def _handle_ivr_locked(
                 (ApiPhone, curr["id"], curr["title"], utcnow().isoformat()),
                 commit=True,
             )
-            # אין שינוי לפלייליסט/אינדקס — רק פידבק, וממשיכים לנגן את אותו שיר.
             return make_ivr_read_command("נוסף למועדפים • ממשיך...", "1", "1", 3, "digits")
         elif ValName == "0":
             await _save_session(ApiPhone, State.MAIN_MENU.value, [], 0)
             return make_ivr_read_command("חוזר לתפריט הראשי", "1", "1", 3, "digits")
         else:
-            # ValName == "1" (הבא) או "" (ללא קלט / טיימאאוט) => מעבר לשיר הבא כברירת מחדל
             index = (index + 1) % total
 
-        # כתיבה אטומית יחידה: state + playlist_json + current_index תמיד יחד,
-        # כך ש-DB וה-RAM לעולם לא מתפצלים לגרסאות לא-מסונכרנות.
         await _save_session(ApiPhone, State.PLAYING_TRACKS.value, playlist, index)
         return await _play_command_or_error(playlist[index]["id"], request, ApiPhone)
 
-    # מצב לא מוכר — נאפס בבטחה חזרה לתפריט במקום לתקוע את השיחה
     logger.warning("Unknown session state %r for phone=%s — resetting", state, ApiPhone)
     await _save_session(ApiPhone, State.MAIN_MENU.value, [], 0)
     return make_ivr_read_command(MAIN_MENU_TEXT, "1", "1", 10, "digits")
 
 
 # ==========================================
-# ❤️ Health check
+# ❤️ Debug + Health
 # ==========================================
 @app.get("/debug/search")
 async def debug_search(q: str = Query(...), token: str = Query(None), verbose: int = Query(0)):
     """כלי אבחון מהיר: בודק מה מנוע החיפוש בפועל מחזיר בלי לחכות לשיחת טלפון.
-    מנוטרל לגמרי (404) אם IVR_DEBUG_TOKEN לא הוגדר — לא נחשף בטעות בפרודקשן.
-    verbose=1 בודק כל שכבה בנפרד (מועיל לאבחן איזו שכבה בדיוק נכשלת),
-    אבל עלול לצרוך quota של Data API — להשתמש בזהירות."""
+    מנוטרל לגמרי (404) אם IVR_DEBUG_TOKEN לא הוגדר.
+    verbose=1 בודק כל שכבה בנפרד (מועיל לאבחן איזו שכבה בדיוק נכשלת)."""
     if not DEBUG_TOKEN:
         raise HTTPException(404)
     if token != DEBUG_TOKEN:
@@ -2394,30 +2100,77 @@ async def debug_search(q: str = Query(...), token: str = Query(None), verbose: i
             result["data_api_v3"] = {"count": len(t), "sample": t[:2]}
         else:
             result["data_api_v3"] = "disabled (no YOUTUBE_DATA_API_KEY)"
+        result["ytdlp_available"] = YTDLP_AVAILABLE
+        if YTDLP_AVAILABLE:
+            t = await search_youtube_ytdlp(q)
+            result["ytdlp"] = {"count": len(t), "sample": t[:2]}
         t = await _search_via_innertube_scrape(q, False)
-        result["innertube_scrape"] = {"count": len(t), "sample": t[:2]}
+        result["innertube_scrape_legacy"] = {"count": len(t), "sample": t[:2]}
         t = await search_invidious_fallback(q)
-        result["invidious"] = {"count": len(t), "sample": t[:2]}
+        result["invidious_legacy"] = {"count": len(t), "sample": t[:2]}
         t = await search_piped_fallback(q)
-        result["piped"] = {"count": len(t), "sample": t[:2]}
+        result["piped_legacy"] = {"count": len(t), "sample": t[:2]}
         return result
 
     tracks = await search_youtube_innertube(q)
     return {"query": q, "count": len(tracks), "tracks": tracks}
 
 
+@app.get("/debug/ytdlp")
+async def debug_ytdlp(
+    token: str = Query(None),
+    video_id: str = Query(None, description="11-char YouTube video id to test-download"),
+):
+    """בודק את שרשרת yt-dlp החדשה בבידוד: הורדת אודיו + המרה ל-WAV טלפוני,
+    בלי לחכות לשיחת טלפון ובלי להעלות לימות. מנוטרל (404) בלי IVR_DEBUG_TOKEN."""
+    if not DEBUG_TOKEN:
+        raise HTTPException(404)
+    if token != DEBUG_TOKEN:
+        raise HTTPException(403, "Invalid token")
+
+    report: dict = {"ytdlp_available": YTDLP_AVAILABLE, "ffmpeg_available": FFMPEG_BIN is not None}
+    if not YTDLP_AVAILABLE:
+        report["conclusion"] = "yt-dlp אינו מותקן — הוסיפו 'yt-dlp' ל-requirements.txt ועשו deploy מחדש."
+        return report
+
+    if not video_id:
+        report["note"] = "ספקו target ?video_id=XXXXXXXXXXX (11 תווים) כדי לבדוק הורדה אמיתית."
+        return report
+
+    if not VIDEO_ID_RE.match(video_id):
+        raise HTTPException(400, "Invalid video ID")
+
+    t0 = time.monotonic()
+    raw = await download_audio_via_ytdlp(video_id)
+    report["download"] = {
+        "ok": raw is not None,
+        "bytes": len(raw) if raw else 0,
+        "seconds": round(time.monotonic() - t0, 2),
+    }
+    if not raw:
+        report["conclusion"] = (
+            "ההורדה נכשלה. בדקו: (1) שהחבילה yt-dlp מעודכנת (pip install -U yt-dlp — "
+            "יוטיוב משנה הגנות לעיתים קרובות), (2) שה-IP של Render לא חסום ע\"י יוטיוב "
+            "(שקלו YTDLP_PROXY), (3) לוגים מפורטים מעל להודעה הזו."
+        )
+        return report
+
+    t1 = time.monotonic()
+    converted = await convert_to_telephony_wav(raw)
+    report["conversion"] = {
+        "ok": converted is not None,
+        "bytes": len(converted) if converted else 0,
+        "seconds": round(time.monotonic() - t1, 2),
+    }
+    report["conclusion"] = "✅ הורדה + המרה הצליחו — הבעיה (אם עדיין קיימת) היא בשכבת ה-Yemot upload, לא כאן."
+    return report
+
+
 @app.get("/debug/yemot")
 async def debug_yemot(token: str = Query(None), target_ext: str = Query(None)):
-    """כלי אבחון מקיף לימות המשיח: מריץ Login, ואז מנסה כמה וריאציות שונות
-    של פורמט הנתיב על CreateIVR2Dir ו-UploadFile (עם קובץ דמה קטן), ומחזיר
-    את *כל* התגובות הגולמיות מהשרת בבת אחת. המטרה: לגלות באיזה פורמט נתיב
-    ימות המשיח שלכם בפועל מצפה, בלי עוד סבב שלם של שיחת טלפון + דפלוי.
-
-    target_ext (אופציונלי, מומלץ מאוד): מספר שלוחה אמיתי שיצרתם ידנית בפאנל
-    הניהול של ימות (למשל '90' או '9/5') — בודק גם נתיבים שמצביעים עליה.
-    זו ההשערה הכי סבירה כרגע: שחייבים שלוחה אמיתית קיימת, לא תיקייה חופשית.
-
-    מנוטרל לגמרי (404) אם IVR_DEBUG_TOKEN לא הוגדר."""
+    """כלי אבחון לימות המשיח: Login + ניסיון UpdateExtension/UploadFile אמיתי
+    עם קובץ דמה קטן, על הנתיב שכבר הוכח כעובד ('ivr2:/<שלוחה>/<קובץ>.wav')
+    וגם על כמה חלופות, למקרה שהחשבון שלכם מוגדר אחרת. מנוטרל (404) בלי טוקן."""
     if not DEBUG_TOKEN:
         raise HTTPException(404)
     if token != DEBUG_TOKEN:
@@ -2429,167 +2182,42 @@ async def debug_yemot(token: str = Query(None), target_ext: str = Query(None)):
     report: dict = {}
 
     yemot_token = await _yemot_login(force=True)
-    report["login"] = {
-        "ok": bool(yemot_token),
-        "token_preview": (yemot_token[:6] + "...") if yemot_token else None,
-    }
+    report["login"] = {"ok": bool(yemot_token), "token_preview": (yemot_token[:6] + "...") if yemot_token else None}
     if not yemot_token:
-        report["conclusion"] = "Login עצמו נכשל — בדקו YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD"
+        report["conclusion"] = "Login עצמו נכשל — בדקו YEMOT_SYSTEM_NUMBER/YEMOT_PASSWORD או YEMOT_API_KEY"
         return report
 
-    # --- UpdateExtension: זו הפקודה האמיתית ליצירת שלוחה (מאומתת מול המדריך
-    # הרשמי למתחילים ב-API) — לא CreateIVR2Dir, שכשל בעקביות בכל בדיקה קודמת
-    # וכנראה endpoint מת/שגוי. אם target_ext סופק, בודקים גם אותו במפורש.
-    # --- UpdateExtension עם type=playfile: מאומת מול רשימת סוגי השלוחות
-    # הרשמית של ימות ('playfile = השמעת קבצים') — זו כנראה הסיבה שהעלאות
-    # נכשלו גם אחרי שהשלוחה 'קיימת': בלי type היא לא בהכרח מיועדת לקבצים.
-    # לא CreateIVR2Dir (endpoint שגוי/לא פעיל שכשל בעקביות בכל בדיקה קודמת).
-    dir_variants = ["ivr2:/ai_songs", "ivr2:ai_songs", "ai_songs", "/ai_songs"]
-    if target_ext:
-        clean_ext = target_ext.strip().strip("/")
-        dir_variants = [f"ivr2:/{clean_ext}", f"ivr2:{clean_ext}"] + dir_variants
-    report["update_extension_attempts"] = []
-    created_paths = []
-    for variant in dir_variants:
-        try:
-            resp = await http_client.post(
-                f"{YEMOT_API_BASE}/UpdateExtension",
-                data={"token": yemot_token, "path": variant, "type": "playfile"},
-                timeout=10.0,
-            )
-            data = resp.json()
-        except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
-            data = {"error": str(e)}
-        report["update_extension_attempts"].append({"path_tried": variant, "type": "playfile", "raw_response": data})
-        if isinstance(data, dict) and data.get("responseStatus") == "OK":
-            created_paths.append(variant)
+    ext_to_test = (target_ext or _bare_yemot_extension()).strip().strip("/")
+    folder_path = f"ivr2:/{ext_to_test}"
 
-    report["propagation_note"] = (
-        "לפי דיווח בפורום המפתחים, UpdateExtension יכול לקחת עד כ-2 דקות עד "
-        "שהשלוחה החדשה 'נתפסת' בפועל. אם UploadFile למטה נכשל על שלוחה "
-        "שדווקא הצליחה כאן (responseStatus=OK) — נסו שוב את /debug/yemot "
-        "הזה בעוד דקה-שתיים לפני שמסיקים שהפורמט שגוי."
+    resp = await http_client.post(
+        f"{YEMOT_API_BASE}/UpdateExtension",
+        data={"token": yemot_token, "path": folder_path, "type": "playfile"},
+        timeout=10.0,
     )
+    report["update_extension"] = {"path_tried": folder_path, "raw_response": resp.json()}
 
-    # --- וריאציות פורמט להעלאת קובץ (UploadFile) — קובץ דמה זעיר, לא שיר אמיתי ---
-    # אם סיפקתם target_ext (מספר שלוחה אמיתי שיצרתם ידנית בפאנל הניהול של
-    # ימות), בודקים גם אותו — זו ההשערה החזקה ביותר כרגע: שהנתיב חייב להצביע
-    # על שלוחה אמיתית שכבר קיימת בחשבון, לא תיקייה וירטואלית חופשית.
-    if created_paths:
-        # המתנה קצרה (לא 2 דקות מלאות — זו קריאת דיבוג אינטראקטיבית, לא שיחה
-        # חיה) לתת סיכוי סביר להפצה לפני שבודקים העלאה.
-        logger.info("Waiting 10s for possible Yemot extension propagation before testing upload...")
-        await asyncio.sleep(10)
-
-    dummy_audio = b"\x00" * 200
+    dummy_wav = b"RIFF" + b"\x00" * 200  # לא WAV תקין אמיתי, רק לבדוק שה-endpoint מקבל את הבקשה
     debug_file_num = await _next_yemot_file_number()
-    # בודקים גם .mp3 וגם .wav ליעד — לפי תיעוד: הפורמט הטלפוני של ימות הוא
-    # WAV, ולכן ה-*יעד* (path) צריך להסתיים ב-.wav גם כשמעלים mp3 בפועל
-    # (עם convertAudio=1).
-    #
-    # חדש: אחרי שכל וריאציות ה-"ivr2:" נכשלו בעקביות עם IllegalStateException
-    # (בעוד "ivr2:" עצמו כן עבד מצוין ל-UpdateExtension/UploadTextFile),
-    # ולכל הנתיבים החשופים (בלי prefix) חזרה שגיאה *שונה* ("path is invalid",
-    # לא IllegalStateException) — זה מרמז חזק ש-UploadFile כנראה לא משתמש
-    # בכלל בסכמת "ivr2:", אלא בסכמה ישנה יותר: "ivr/<שלוחה>/<תת-שלוחה>/<קובץ>"
-    # (בלי נקודתיים). נמצאה דוגמה אמיתית מאושרת מהעבר עם path כזה שחזר בהצלחה.
-    base_names = [f"ivr2:/ai_songs/{debug_file_num}", f"ivr2:ai_songs/{debug_file_num}",
-                  f"ivr2:/{debug_file_num}", f"ivr2:{debug_file_num}",
-                  f"ivr2:/1/{debug_file_num}", f"1/{debug_file_num}", f"{debug_file_num}"]
-    if target_ext:
-        clean_ext = target_ext.strip().strip("/")
-        base_names = [f"ivr2:/{clean_ext}/{debug_file_num}", f"ivr2:{clean_ext}/{debug_file_num}",
-                      f"{clean_ext}/{debug_file_num}",
-                      # סכמה ישנה "ivr/" (בלי נקודתיים) — לא נבדקה עדיין כלל
-                      f"ivr/{clean_ext}/{debug_file_num}",
-                      f"ivr/{clean_ext}/1/{debug_file_num}",
-                      f"ivr/1/{clean_ext}/{debug_file_num}"] + base_names
-    upload_variants = [f"{base}.{ext}" for base in base_names for ext in ("wav", "mp3")]
-    report["upload_attempts"] = []
-    successful_path = None
-    for variant in upload_variants:
-        upload_filename = "test." + variant.rsplit(".", 1)[-1]  # שם הקובץ הנשלח תמיד תואם לסיומת היעד כאן
-        try:
-            resp = await http_client.post(
-                f"{YEMOT_API_BASE}/UploadFile",
-                data={"token": yemot_token, "path": variant, "convertAudio": "1"},
-                files={"file": (upload_filename, dummy_audio, "audio/mpeg")},
-                timeout=15.0,
-            )
-            data = resp.json()
-        except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
-            data = {"error": str(e)}
-        report["upload_attempts"].append({"path_tried": variant, "raw_response": data})
-        if isinstance(data, dict) and data.get("responseStatus") == "OK" and successful_path is None:
-            successful_path = variant
+    upload_path = f"{folder_path}/{debug_file_num}.wav"
+    resp2 = await http_client.post(
+        f"{YEMOT_API_BASE}/UploadFile",
+        data={"token": yemot_token, "path": upload_path},
+        files={"file": (f"{debug_file_num}.wav", dummy_wav, "audio/wav")},
+        timeout=15.0,
+    )
+    data2 = resp2.json()
+    report["upload_attempt"] = {"path_tried": upload_path, "raw_response": data2}
 
-    if successful_path:
-        report["conclusion"] = (
-            f"✅ נמצא פורמט עובד: {successful_path!r} — עדכנו YEMOT_UPLOAD_FOLDER "
-            f"בהתאם (בלי שם הקובץ) והריצו שוב."
-        )
-        # מנקים את קובץ הבדיקה כדי לא להשאיר זבל בחשבון
-        await _yemot_delete_file(successful_path)
+    if data2.get("responseStatus") == "OK":
+        await _yemot_delete_file(data2.get("path") or upload_path)
+        report["conclusion"] = f"✅ העלאה לימות עובדת עם הנתיב {upload_path!r}. YEMOT_UPLOAD_FOLDER תקין."
     else:
-        # סבב שני: אם כל וריאציות ה-path נכשלו (כמו שקרה בפועל), הבעיה כנראה
-        # לא בנתיב בכלל — UploadTextFile הצליח עם path כמעט זהה ל-UploadFile
-        # שנכשל. בודקים כאן משתני multipart אחרים: שם שדה הקובץ, Content-Type,
-        # וערך convertAudio — משתנים שמעולם לא שינינו.
-        probe_path = f"{clean_ext if target_ext else 'ai_songs'}/{debug_file_num}.wav"
-        if not probe_path.startswith("ivr2:"):
-            probe_path = f"ivr2:/{probe_path}"
-        field_names = ["file", "audioFile", "recording", "media", "uploadFile", "content"]
-        content_types = ["audio/wav", "audio/x-wav", "audio/mpeg", "application/octet-stream"]
-        convert_audio_values = ["1", "true", None]
-
-        report["request_shape_attempts"] = []
-        shape_success = None
-        for field_name in field_names:
-            for content_type in content_types:
-                for convert_val in convert_audio_values:
-                    data = {"token": yemot_token, "path": probe_path}
-                    if convert_val is not None:
-                        data["convertAudio"] = convert_val
-                    try:
-                        resp = await http_client.post(
-                            f"{YEMOT_API_BASE}/UploadFile",
-                            data=data,
-                            files={field_name: ("probe.wav", dummy_audio, content_type)},
-                            timeout=15.0,
-                        )
-                        result = resp.json()
-                    except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError) as e:
-                        result = {"error": str(e)}
-                    attempt = {
-                        "field_name": field_name, "content_type": content_type,
-                        "convertAudio": convert_val, "raw_response": result,
-                    }
-                    report["request_shape_attempts"].append(attempt)
-                    if isinstance(result, dict) and result.get("responseStatus") == "OK" and shape_success is None:
-                        shape_success = attempt
-                        break
-                if shape_success:
-                    break
-            if shape_success:
-                break
-
-        if shape_success:
-            await _yemot_delete_file(probe_path)
-            report["conclusion"] = (
-                f"✅ הבעיה לא הייתה בנתיב! נמצאה צורת בקשה עובדת: field_name="
-                f"{shape_success['field_name']!r}, content_type={shape_success['content_type']!r}, "
-                f"convertAudio={shape_success['convertAudio']!r}."
-            )
-        else:
-            report["conclusion"] = (
-                "❌ גם שינוי צורת הבקשה (שם שדה/Content-Type/convertAudio) לא עזר. "
-                "נבדקו עשרות קומבינציות של נתיב וגם עשרות קומבינציות של צורת בקשה, "
-                "כולן נכשלות. בשלב הזה, הכי יעיל לפנות ישירות לתמיכה הטכנית של "
-                "ימות המשיח עם ה-JSON הזה (כולל update_extension_attempts שהצליחו "
-                "לעומת upload_attempts/request_shape_attempts שנכשלו) ולשאול אותם "
-                "במפורש: מה שונה ב-UploadFile לעומת UploadTextFile שגורם ל-"
-                "IllegalStateException, כשאותו token/שלוחה עובדים מצוין בשתי הפקודות האחרות."
-            )
+        report["conclusion"] = (
+            "❌ ההעלאה נכשלה על הנתיב הזה. ודאו שיצרתם ידנית שלוחה בשם הזה בפאנל הניהול "
+            "של ימות, או נסו target_ext אחר. שימו לב: אם /debug/ytdlp כן עובד, הבעיה "
+            "ממוקדת בצד ימות ולא בהורדת האודיו."
+        )
 
     return report
 
@@ -2607,8 +2235,9 @@ async def health():
         "clearing_enabled": CLEARING_ENABLED,
         "redis_enabled": _redis is not None,
         "whitelist_count": len(DEFAULT_WHITELIST),
-        "youtube_proxy_configured": bool(YOUTUBE_PROXY_BASE),
         "youtube_data_api_enabled": YOUTUBE_DATA_API_ENABLED,
+        "ytdlp_available": YTDLP_AVAILABLE,
+        "ffmpeg_available": FFMPEG_BIN is not None,
         "yemot_upload_enabled": YEMOT_ENABLED,
         "yemot_auto_delete_after_play": YEMOT_AUTO_DELETE_AFTER_PLAY if YEMOT_ENABLED else None,
         "free_stt_enabled": STT_ENABLED,
