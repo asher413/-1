@@ -4,3 +4,4 @@ httpx
 cachetools
 imageio-ffmpeg
 python-multipart
+yt-dlp
